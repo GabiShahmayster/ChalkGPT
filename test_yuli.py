@@ -70,7 +70,7 @@ if __name__ == "__main__":
     yolo_detector = YOLODetector()
     
     MASK = True
-    DISPLAY_FRAMES = True
+    DISPLAY_FRAMES = False
     video_dir = "assets/video_short"
     # video_dir = "downloaded_frames"
     inference_state = predictor.init_state(video_path=video_dir)

@@ -3,7 +3,7 @@ import cv2
 import os
 import numpy as np
 
-def download_frames(url, start_time, num_frames, output_dir):
+def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0):
     # Configure yt-dlp options
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]',
@@ -30,11 +30,16 @@ def download_frames(url, start_time, num_frames, output_dir):
     for i in range(num_frames):
         ret, frame = video.read()
         if ret:
+            # Resize frame
+            new_width = int(frame.shape[1] / resize_factor)
+            new_height = int(frame.shape[0] / resize_factor)
+            resized_frame = cv2.resize(frame, (new_width, new_height))
+            
             # Save frame
-            cv2.imwrite(os.path.join(output_dir, f'{i:03d}.jpg'), frame)
+            cv2.imwrite(os.path.join(output_dir, f'{i:03d}.jpg'), resized_frame)
             
             # Display frame
-            cv2.imshow('Video Frame', frame)
+            cv2.imshow('Video Frame', resized_frame)
             
             # Wait for 30 ms and check if user wants to quit
             if cv2.waitKey(30) & 0xFF == ord('q'):
@@ -51,7 +56,7 @@ if __name__ == "__main__":
 
 # Usage
     url = 'https://www.youtube.com/watch?v=7L8vDnSDrXc&list=PLwLYTnsgqjj8St3u1Xy8OLMnej7tq5JWy&index=2'
-    start_time = 1 * 60 + 47  # 22:27 in seconds
+    start_time = 17 * 60 + 4  # 22:27 in seconds
     num_frames = 100
     output_dir = 'downloaded_frames'
 

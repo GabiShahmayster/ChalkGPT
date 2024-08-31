@@ -70,9 +70,10 @@ if __name__ == "__main__":
     yolo_detector = YOLODetector()
     
     MASK = True
-    DISPLAY_FRAMES = True
-    video_dir = "assets/video_short"
-    # video_dir = "downloaded_frames"
+    DISPLAY_FRAMES = False
+    DISPLAY_ALL_YOLO_OBJECTS = False  # New flag to display all YOLO detected objects
+    # video_dir = "assets/video_short"
+    video_dir = "downloaded_frames"
     inference_state = predictor.init_state(video_path=video_dir)
     
     frame_names = [p for p in os.listdir(video_dir) if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg"]]
@@ -96,9 +97,6 @@ if __name__ == "__main__":
                         x_center, y_center = (x1 + x2) / 2, (y1 + y2) / 2
                         person_center = [x_center.item(), y_center.item()]
 
-        if len(frame_names) > 15 and ann_frame_idx < 15:
-            continue
-
         points = [person_center] if person_center else [[950, 600], [500, 300]]
         labels = np.ones(len(points), dtype=np.int32)
         points = np.array(points, dtype=np.float32)
@@ -120,7 +118,7 @@ if __name__ == "__main__":
         else:
             masked_frame = Image.open(os.path.join(video_dir, frame_names[ann_frame_idx]))
 
-        masked_frame = masked_frame[:760, :]
+        # masked_frame = masked_frame[:760, :]
 
         if DISPLAY_FRAMES:
             plt.title(f"frame {ann_frame_idx}")
@@ -128,6 +126,16 @@ if __name__ == "__main__":
             if not MASK:
                 show_points(points, labels, plt.gca())
                 show_mask((out_mask_logits[0] > 0.0).cpu().numpy(), plt.gca(), obj_id=out_obj_ids[0])
+            
+            if DISPLAY_ALL_YOLO_OBJECTS and len(yolo_results) > 0:
+                ax = plt.gca()
+                for result in yolo_results[0].boxes:
+                    x1, y1, x2, y2 = result.xyxy[0].cpu()
+                    rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor='red', linewidth=2)
+                    ax.add_patch(rect)
+                    class_name = yolo_detector.model.names[int(result.cls)]
+                    ax.text(x1, y1, class_name, bbox=dict(facecolor='red', alpha=0.5), fontsize=8, color='white')
+            
             plt.draw()
             plt.pause(0.001)
             if len(frame_names) == 1:
