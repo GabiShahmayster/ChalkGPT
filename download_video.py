@@ -3,7 +3,7 @@ import cv2
 import os
 import numpy as np
 
-def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0):
+def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, force_download: bool = False):
     # Configure yt-dlp options
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]',
@@ -11,7 +11,7 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0):
     }
 
     # Download the video
-    if not os.path.exists('temp_video.mp4'):
+    if not os.path.exists('temp_video.mp4') or force_download:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -55,10 +55,10 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0):
 if __name__ == "__main__":
 
 # Usage
-    url = 'https://www.youtube.com/watch?v=7L8vDnSDrXc&list=PLwLYTnsgqjj8St3u1Xy8OLMnej7tq5JWy&index=2'
-    start_time = 17 * 60 + 4  # 22:27 in seconds
+    url = 'https://www.youtube.com/watch?v=gtIGgs_y2nY'
+    start_time = 22  # 22:27 in seconds
     num_frames = 100
     output_dir = 'downloaded_frames'
 
-    download_frames(url, start_time, num_frames, output_dir)
+    download_frames(url, start_time, num_frames, output_dir, force_download=True)
 
