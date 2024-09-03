@@ -6,17 +6,19 @@ import numpy as np
 def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, force_download: bool = False):
     # Configure yt-dlp options
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4]',
+        'format': 'bestvideo[ext=mp4][height<=720][abr<250]+bestaudio/best[height<=720]',
         'outtmpl': 'temp_video.%(ext)s'
     }
-
+    """
+    youtube-dl --get-title -f 'bestvideo[ext=mp4][height<=640][abr<250]+bestaudio/best[height<=640]' https://www.youtube.com/watch?v=VIDEO_ID --get-title 00:00:10-00:00:20
+    """
     # Download the video
     if not os.path.exists('temp_video.mp4') or force_download:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
     # Open the video file
-    video = cv2.VideoCapture('temp_video.mp4')
+    video = cv2.VideoCapture('temp_video.webm')
 
     # Set the starting point
     fps = video.get(cv2.CAP_PROP_FPS)
@@ -55,10 +57,10 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, 
 if __name__ == "__main__":
 
 # Usage
-    url = 'https://www.youtube.com/watch?v=gtIGgs_y2nY'
+    url = 'https://www.youtube.com/watch?v=H4hAegl_wfM'
     start_time = 22  # 22:27 in seconds
-    num_frames = 100
+    num_frames = 500
     output_dir = 'downloaded_frames'
 
-    download_frames(url, start_time, num_frames, output_dir, force_download=True)
+    download_frames(url, start_time, num_frames, output_dir, force_download=True, resize_factor=1)
 

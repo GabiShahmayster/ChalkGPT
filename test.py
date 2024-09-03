@@ -1,11 +1,13 @@
 import os
 import cv2
 import numpy as np
+import super_gradients
 import torch
 from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib import pyplot as plt
 import matplotlib
+from super_gradients.training.utils.predict import ImagePoseEstimationPrediction
 from tqdm import tqdm
 from sam2.build_sam import build_sam2_video_predictor
 from yolo import YOLODetector
@@ -107,14 +109,15 @@ def initialize_models():
         model_cfg = "sam2_hiera_l.yaml"
         predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
         yolo_detector = YOLODetector()
-        return predictor, yolo_detector
+        pose_estimator = super_gradients.training.models.get("yolo_nas_pose_l", pretrained_weights="coco_pose").cuda()
+        return predictor, yolo_detector, pose_estimator
 
 def get_frame_names(video_dir):
     frame_names = [p for p in os.listdir(video_dir) if os.path.splitext(p)[-1].lower() in [".jpg", ".jpeg"]]
     frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
     return frame_names
 
-def get_person_center(yolo_results):
+def get_person_center_from_yolo(yolo_results):
     person_center = None
     largest_person_area = 0
     if len(yolo_results) > 0:
@@ -148,9 +151,18 @@ def get_person_center(yolo_results):
                     person_center = [center[0], center[1]]
     return person_center
 
-def process_frame(predictor, yolo_detector, inference_state, ann_frame_idx, image_path, mask):
+
+def get_person_center_from_pose_estimator(model_predictions: ImagePoseEstimationPrediction):
+    return tuple(model_predictions.prediction.poses[0,:,:2][4])
+
+
+def process_frame(predictor, yolo_detector, pose_estimator, inference_state, ann_frame_idx, image_path, mask):
     yolo_results = yolo_detector.detect(image_path)
-    person_center = get_person_center(yolo_results)
+    im: np.ndarray = cv2.imread(image_path)
+    model_predictions: ImagePoseEstimationPrediction = pose_estimator.predict(im, conf=0.5)
+
+    person_center = get_person_center_from_pose_estimator(model_predictions)
+    person_center = get_person_center_from_yolo(yolo_results)
     
     points = [person_center] if person_center else [[950, 600], [500, 300]]
     labels = np.ones(len(points), dtype=np.int32)
@@ -209,9 +221,9 @@ def write_video_frame(video_writer, masked_frame):
 
 
 if __name__ == "__main__":
-    predictor, yolo_detector = initialize_models()
+    predictor, yolo_detector, pose_estimator = initialize_models()
     
-    MASK = True
+    MASK = False
     DISPLAY_FRAMES = True
     DISPLAY_ALL_YOLO_OBJECTS = False  # New flag to display all YOLO detected objects
     # video_dir = "assets/video_short"
@@ -226,6 +238,7 @@ if __name__ == "__main__":
         masked_frame, points, labels, out_obj_ids, out_mask_logits, yolo_results = process_frame(
             predictor=predictor,
             yolo_detector=yolo_detector,
+            pose_estimator=pose_estimator,
             inference_state=inference_state,
             ann_frame_idx=ann_frame_idx,
             image_path=image_path,
