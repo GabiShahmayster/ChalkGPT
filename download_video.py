@@ -13,7 +13,7 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, 
     youtube-dl --get-title -f 'bestvideo[ext=mp4][height<=640][abr<250]+bestaudio/best[height<=640]' https://www.youtube.com/watch?v=VIDEO_ID --get-title 00:00:10-00:00:20
     """
     # Download the video
-    if not os.path.exists('temp_video.mp4') or force_download:
+    if not os.path.exists('temp_video.webm') or force_download:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -57,10 +57,10 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, 
 if __name__ == "__main__":
 
 # Usage
-    url = 'https://www.youtube.com/watch?v=H4hAegl_wfM'
-    start_time = 22  # 22:27 in seconds
-    num_frames = 500
-    output_dir = 'downloaded_frames'
+    url = 'https://www.youtube.com/watch?v=b2v4brHpdxY&t=130s'
+    start_time = 2*60+12  # 22:27 in seconds
+    num_frames = 250
+    output_dir = 'downloaded_frames_new'
 
     download_frames(url, start_time, num_frames, output_dir, force_download=True, resize_factor=1)
 
