@@ -1,19 +1,22 @@
 import yt_dlp
 import cv2
 import os
-import numpy as np
 
 def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, force_download: bool = False):
+
     # Configure yt-dlp options
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4][height<=720][abr<250]+bestaudio/best[height<=720]',
+        'format': 'bestvideo[ext=webm][height<=720][abr<250]+bestaudio/best[height<=720]',
         'outtmpl': 'temp_video.%(ext)s'
     }
     """
-    youtube-dl --get-title -f 'bestvideo[ext=mp4][height<=640][abr<250]+bestaudio/best[height<=640]' https://www.youtube.com/watch?v=VIDEO_ID --get-title 00:00:10-00:00:20
+    youtube-dl --get-title -f 'bestvideo[ext=webm][height<=640][abr<250]+bestaudio/best[height<=640]' https://www.youtube.com/watch?v=VIDEO_ID --get-title 00:00:10-00:00:20
     """
+    if force_download and os.path.exists('temp_video.webm'):
+        os.remove('temp_video.webm')
+
     # Download the video
-    if not os.path.exists('temp_video.webm') or force_download:
+    if not os.path.exists('temp_video.webm'):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -57,10 +60,10 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, 
 if __name__ == "__main__":
 
 # Usage
-    url = 'https://www.youtube.com/watch?v=b2v4brHpdxY&t=130s'
-    start_time = 2*60+12  # 22:27 in seconds
-    num_frames = 250
+    url = 'https://youtu.be/mGKZC3f1IC4?si=p3YtYYmh4tfl-7Wd'
+    start_time = 0  # 22:27 in seconds
+    num_frames = 19*30
     output_dir = 'downloaded_frames_new'
 
-    download_frames(url, start_time, num_frames, output_dir, force_download=True, resize_factor=1)
+    download_frames(url, start_time, num_frames, output_dir, force_download=True, resize_factor=0.33)
 
