@@ -63,68 +63,81 @@ def get_bounding_box(mask: np.ndarray, pad: int = 0) -> BoundingBox:
     return BoundingBox((max(0, top_left_x-pad), max(0, top_left_y-pad)),
                        (min(mask.shape[1], bottom_right_x+pad), min(mask.shape[0], bottom_right_y+pad)))
 
+class ChalkGpt:
+    video_dir: str
+    predictor: object
+    pose_estimator: object
+
+    CLIMBER_OBJECT_ID = 1
+
+    def __init__(self, video_dir: str):
+        self.video_dir = video_dir
+
+        sam2_checkpoint = "checkpoints/sam2_hiera_small.pt"
+        model_cfg = "sam2_hiera_s.yaml"
+        self.predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
+
+        self.yolo_nas = super_gradients.training.models.get("yolo_nas_pose_l", pretrained_weights="coco_pose").cuda()
+        self.yolo_nas.eval()
+
+
+    def run(self):
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+            inference_state = self.predictor.init_state(video_path=self.video_dir, offload_video_to_cpu=True,
+                                                   offload_state_to_cpu=True)
+
+            frame_names = [
+                p for p in os.listdir(self.video_dir)
+                if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+            ]
+            frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+
+            ann_frame_idx = 0
+            ann_obj_id = self.CLIMBER_OBJECT_ID
+
+            points = np.array([[495, 320]], dtype=np.float32)
+            labels = np.array([self.CLIMBER_OBJECT_ID], np.int32)
+            _, out_obj_ids, out_mask_logits = self.predictor.add_new_points(
+                inference_state=inference_state,
+                frame_idx=ann_frame_idx,
+                obj_id=ann_obj_id,
+                points=points,
+                labels=labels,
+            )
+
+            video_segments = {}
+            for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(inference_state):
+                video_segments[out_frame_idx] = {
+                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                    for i, out_obj_id in enumerate(out_obj_ids)
+                }
+
+            for out_frame_idx in range(0, len(frame_names)):
+                for out_obj_id, out_mask in video_segments[out_frame_idx].items():
+                    if out_obj_id != self.CLIMBER_OBJECT_ID:
+                        continue
+                    out_mask = out_mask.squeeze()
+                    bbox = get_bounding_box(mask=out_mask, pad=50)
+                    frame: np.ndarray = cv2.imread(os.path.join(self.video_dir, frame_names[out_frame_idx]))
+                    climber_crop = frame[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
+                    cv2.imshow("climber crop", climber_crop)
+
+                    pose: ImagePoseEstimationPrediction = self.yolo_nas.predict(climber_crop, conf=0.3, fuse_model=False)
+                    pose_draw = pose.draw()
+                    cv2.imshow("climber pose", pose_draw)
+
+                    mask_3d = np.stack((0 * out_mask, 0 * out_mask, out_mask), axis=2).astype(np.uint8)
+                    blend = cv2.blendLinear(frame, 255 * mask_3d, 0.5 * np.ones_like(out_mask, dtype=np.float32),
+                                            0.5 * np.ones_like(out_mask, dtype=np.float32))
+
+                    cv2.imshow("blended frame", blend)
+
+                    while True:
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == 32:  # 32 is the ASCII code for spacebar
+                            break
 
 if __name__ == "__main__":
-    sam2_checkpoint = "checkpoints/sam2_hiera_small.pt"
-    model_cfg = "sam2_hiera_s.yaml"
-    predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
+    chalk_gpt: ChalkGpt = ChalkGpt(video_dir='downloaded_frames_tag')
+    chalk_gpt.run()
 
-    yolo_nas = super_gradients.training.models.get("yolo_nas_pose_l", pretrained_weights="coco_pose").cuda()
-    yolo_nas.eval()
-
-    video_dir = "downloaded_frames_tag"
-    CLIMBER_OBJECT_ID = 1
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-        inference_state = predictor.init_state(video_path=video_dir, offload_video_to_cpu=True, offload_state_to_cpu=True)
-
-        frame_names = [
-            p for p in os.listdir(video_dir)
-            if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-        ]
-        frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
-
-        ann_frame_idx = 0
-        ann_obj_id = CLIMBER_OBJECT_ID
-
-        points = np.array([[495, 320]], dtype=np.float32)
-        labels = np.array([CLIMBER_OBJECT_ID], np.int32)
-        _, out_obj_ids, out_mask_logits = predictor.add_new_points(
-            inference_state=inference_state,
-            frame_idx=ann_frame_idx,
-            obj_id=ann_obj_id,
-            points=points,
-            labels=labels,
-        )
-
-        video_segments = {}
-        for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
-            video_segments[out_frame_idx] = {
-                out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                for i, out_obj_id in enumerate(out_obj_ids)
-            }
-
-        for out_frame_idx in range(0, len(frame_names)):
-            for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-                if out_obj_id != CLIMBER_OBJECT_ID:
-                    continue
-                out_mask = out_mask.squeeze()
-                bbox = get_bounding_box(mask=out_mask, pad=50)
-                frame: np.ndarray = cv2.imread(os.path.join(video_dir, frame_names[out_frame_idx]))
-                climber_crop = frame[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
-                cv2.imshow("climber crop",climber_crop)
-
-                pose: ImagePoseEstimationPrediction = yolo_nas.predict(climber_crop, conf=0.3, fuse_model=False)
-                pose_draw = pose.draw()
-                cv2.imshow("climber pose",pose_draw)
-
-                mask_3d = np.stack((0 * out_mask, 0 * out_mask, out_mask), axis=2).astype(np.uint8)
-                blend = cv2.blendLinear(frame, 255 * mask_3d, 0.5 * np.ones_like(out_mask, dtype=np.float32),
-                                        0.5 * np.ones_like(out_mask, dtype=np.float32))
-
-                cv2.imshow("blended frame",blend)
-
-                
-                while True:
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == 32:  # 32 is the ASCII code for spacebar
-                        break
