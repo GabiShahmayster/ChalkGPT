@@ -2,6 +2,7 @@ import dataclasses
 import os
 import pickle
 import time
+from typing import Dict, List
 
 import cv2
 import numpy as np
@@ -11,8 +12,12 @@ from matplotlib import pyplot as plt
 from PIL import Image
 from super_gradients.training.utils.predict import ImagePoseEstimationPrediction
 
+from lightglue import LightGlue
 from sam2.build_sam import build_sam2_video_predictor
 from dataclasses import dataclass
+
+from superpoint import SuperPoint
+
 
 @dataclass
 class BoundingBox:
@@ -70,6 +75,41 @@ class ChalkGptConfig:
     save_to_disk: bool
     try_to_load_from_disk: bool
     video_dir: str
+    lightglue_match_threshold: float
+    device: torch.device
+
+
+def get_opencv_kpt(pt, score) -> cv2.KeyPoint:
+    kpt = cv2.KeyPoint()
+    kpt.pt = tuple(pt)
+    kpt.response = score
+    return kpt
+
+@dataclasses.dataclass
+class LightGlueResult:
+    drone_kpts: List[cv2.KeyPoint]
+    sat_kpts: List[cv2.KeyPoint]
+    matches: List[cv2.DMatch]
+
+
+def lightglue_to_opencv_matches(input_dict: Dict, lightlue_output: Dict) -> LightGlueResult:
+    matches: List[cv2.DMatch] = []
+    query_kpts: List[cv2.KeyPoint] = []
+    train_kpts: List[cv2.KeyPoint] = []
+    matches_indices: np.ndarray = lightlue_output['matches'][0].detach().cpu().numpy()
+    detected_kpts0: np.ndarray = input_dict['image0']['keypoints'][0].detach().cpu().numpy()
+    detected_kpts1: np.ndarray = input_dict['image1']['keypoints'][0].detach().cpu().numpy()
+    scores: np.ndarray = lightlue_output['scores'][0].detach().cpu().numpy()
+    for idx, (m, score) in enumerate(zip(matches_indices, scores)):
+        match: cv2.DMatch = cv2.DMatch()
+        match.queryIdx = idx
+        match.trainIdx = idx
+        matches.append(match)
+        query_kpts.append(get_opencv_kpt(detected_kpts0[m[0]], score))
+        train_kpts.append(get_opencv_kpt(detected_kpts1[m[1]], score))
+    return LightGlueResult(drone_kpts=query_kpts,
+                           sat_kpts=train_kpts,
+                           matches=matches)
 
 class ChalkGpt:
     config: ChalkGptConfig
@@ -77,6 +117,7 @@ class ChalkGpt:
     pose_estimator: object
 
     CLIMBER_OBJECT_ID = 1
+    WALL_OBJECT_ID = 2
 
     def __init__(self, config: ChalkGptConfig):
         self.config = config
@@ -87,6 +128,11 @@ class ChalkGpt:
 
         self.yolo_nas = super_gradients.training.models.get("yolo_nas_pose_l", pretrained_weights="coco_pose").cuda()
         self.yolo_nas.eval()
+
+        superpoint_config = {}
+        lightglue_config = {"filter_threshold": self.config.lightglue_match_threshold}
+        self.detector = SuperPoint(config=superpoint_config).to(self.config.device)
+        self.matcher = LightGlue(features='superpoint', **lightglue_config).to(self.config.device)
 
     def main(self):
         process_frames: bool = True
@@ -108,6 +154,7 @@ class ChalkGpt:
                 with open(output_path, 'wb') as f:
                     pickle.dump(save_data, f)
 
+        self.estimate_relative_motion(frame_names=frame_names)
         self.visualize(video_segments=video_segments, frame_names=frame_names)
 
     def init_frames(self):
@@ -167,13 +214,45 @@ class ChalkGpt:
                 cv2.imshow("blended frame", blend)
 
                 while True:
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == 32:  # 32 is the ASCII code for spacebar
+                     key = cv2.waitKey(1) & 0xFF
+                     if key == 32:  # 32 is the ASCII code for spacebar
                         break
+
+    def get_lightlue_input(self, detector_output: Dict, image: torch.Tensor):
+        """
+        https://kornia.readthedocs.io/en/latest/feature.html
+        keypoints: [B x M x 2]
+        descriptors: [B x M x D]
+        image: [B x C x H x W] or image_size: [B x 2]
+        """
+        im_size: torch.Tensor = torch.unsqueeze(torch.Tensor([image.shape[2], image.shape[3]]), dim=0)
+        return {"keypoints": torch.unsqueeze(detector_output['keypoints'][0], dim=0),
+                "descriptors": torch.unsqueeze(detector_output['descriptors'][0].T, dim=0),
+                "image_size": im_size}
+
+    def image_to_tensor(self, im: np.ndarray) -> torch.Tensor:
+        # return BxCxHxW tensor
+        assert len(im.shape) == 3, "image_to_tensor must be provided with BGR images"
+        im = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+        return torch.from_numpy(im / 255.).float()[None, None].to(self.config.device)
+
+    def estimate_relative_motion(self, frame_names):
+        for i in range(0, len(frame_names)-1):
+            img_0 = self.image_to_tensor(cv2.imread(os.path.join(self.config.video_dir,frame_names[i])))
+            img_1 = self.image_to_tensor(cv2.imread(os.path.join(self.config.video_dir,frame_names[i+1])))
+
+            img0_det = self.detector({"image": img_0})
+            img1_det = self.detector({"image": img_1})
+            lightglue_input_dict = {"image0": self.get_lightlue_input(img0_det, img_0),
+                                    "image1": self.get_lightlue_input(img1_det, img_1)}
+            res = self.matcher(lightglue_input_dict)
+            a=3
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
                                             try_to_load_from_disk=True,
-                                            video_dir='downloaded_frames_tag')
+                                            video_dir='downloaded_frames_tag',
+                                            device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
+                                            lightglue_match_threshold=.1)
     chalk_gpt: ChalkGpt = ChalkGpt(config)
     chalk_gpt.main()
