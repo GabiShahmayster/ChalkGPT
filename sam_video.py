@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import os
 import pickle
 import time
@@ -8,6 +9,7 @@ import cv2
 import numpy as np
 import super_gradients
 import torch
+import tqdm
 from matplotlib import pyplot as plt
 from PIL import Image
 from super_gradients.training.utils.predict import ImagePoseEstimationPrediction
@@ -23,6 +25,15 @@ from superpoint import SuperPoint
 class BoundingBox:
     top_left: tuple
     bottom_right: tuple
+
+    def apply_transform(self, T: np.ndarray):
+        tl_h: np.ndarray = np.array([self.top_left[0], self.top_left[1], 1.0]).reshape((3, 1))
+        br_h: np.ndarray = np.array([self.bottom_right[0], self.bottom_right[1], 1.0]).reshape((3, 1))
+        T_h = np.vstack((T, np.array([.0, .0, 1.0]).reshape((1,3))))
+        tl = T_h @ tl_h
+        br = T_h @ br_h
+        self.top_left = tuple(tl[:2].squeeze().astype(int))
+        self.bottom_right = tuple(br[:2].squeeze().astype(int))
 
 def show_mask(mask, ax, obj_id=None, random_color=False):
     if random_color:
@@ -87,8 +98,8 @@ def get_opencv_kpt(pt, score) -> cv2.KeyPoint:
 
 @dataclasses.dataclass
 class LightGlueResult:
-    drone_kpts: List[cv2.KeyPoint]
-    sat_kpts: List[cv2.KeyPoint]
+    img_0_kpts: List[cv2.KeyPoint]
+    img_1_kpts: List[cv2.KeyPoint]
     matches: List[cv2.DMatch]
 
 
@@ -107,9 +118,23 @@ def lightglue_to_opencv_matches(input_dict: Dict, lightlue_output: Dict) -> Ligh
         matches.append(match)
         query_kpts.append(get_opencv_kpt(detected_kpts0[m[0]], score))
         train_kpts.append(get_opencv_kpt(detected_kpts1[m[1]], score))
-    return LightGlueResult(drone_kpts=query_kpts,
-                           sat_kpts=train_kpts,
+    return LightGlueResult(img_0_kpts=query_kpts,
+                           img_1_kpts=train_kpts,
                            matches=matches)
+
+def estimate_relative_pose(matching_results: LightGlueResult) -> np.ndarray:
+    INLIER_THRESHOLD: float = 1.0
+    maxIters: int = 10000
+    confidence = 0.9999
+    refineIters: int = 10000
+    kpts0: np.ndarray = np.array([np.array(k.pt) for k in matching_results.img_0_kpts])
+    kpts1: np.ndarray = np.array([np.array(k.pt) for k in matching_results.img_1_kpts])
+    mat, inliers = cv2.estimateAffinePartial2D(from_=kpts1, to=kpts0, method=cv2.RANSAC,
+                                        ransacReprojThreshold=INLIER_THRESHOLD, maxIters=maxIters, confidence=confidence,
+                                        refineIters=refineIters)
+    s = np.linalg.norm(mat[0,:2])
+    mat[:2,:2] /= s
+    return mat
 
 class ChalkGpt:
     config: ChalkGptConfig
@@ -118,7 +143,9 @@ class ChalkGpt:
 
     CLIMBER_OBJECT_ID = 1
     WALL_OBJECT_ID = 2
-
+    transform_from_first_frame: Dict[str, np.ndarray]
+    H_ext: int
+    W_ext: int
     def __init__(self, config: ChalkGptConfig):
         self.config = config
 
@@ -154,6 +181,7 @@ class ChalkGpt:
                 with open(output_path, 'wb') as f:
                     pickle.dump(save_data, f)
 
+        self.transform_from_first_frame = {}
         self.estimate_relative_motion(frame_names=frame_names)
         self.visualize(video_segments=video_segments, frame_names=frame_names)
 
@@ -192,7 +220,32 @@ class ChalkGpt:
 
             return video_segments
 
+    def get_world_frame(self, frame_names) -> np.ndarray:
+        """
+        Define extended frame to contain camera motion
+        """
+        delta_x_per_frame = np.array([t[0, 2] for t in self.transform_from_first_frame.values()])
+        delta_y_per_frame = np.array([t[1, 2] for t in self.transform_from_first_frame.values()])
+        max_delta_x = delta_x_per_frame[np.argmax(np.abs(delta_x_per_frame))]
+        max_delta_y = delta_y_per_frame[np.argmax(np.abs(delta_y_per_frame))]
+        frame: np.ndarray = cv2.imread(os.path.join(self.config.video_dir, frame_names[0]))
+        H, W = frame.shape[:2]
+        self.H_ext = int(abs(max_delta_y))
+        self.W_ext = int(abs(max_delta_x))
+        if len(frame.shape) == 3:
+            world_frame: np.ndarray = np.zeros((H + 2*self.H_ext, W + 2*self.W_ext, 3), dtype=frame.dtype)
+        else:
+            world_frame: np.ndarray = np.zeros((H + 2*self.H_ext, W + 2*self.W_ext), dtype=frame.dtype)
+        return world_frame
+
+    def get_world_frame_placement_transform(self) -> np.ndarray:
+        out: np.ndarray = np.hstack((np.eye(2), np.zeros((2,1))))
+        out[0, 2] = self.W_ext
+        out[1, 2] = self.H_ext
+        return out
+
     def visualize(self, video_segments, frame_names):
+        world_frame: np.ndarray = self.get_world_frame(frame_names)
         for out_frame_idx in range(0, len(frame_names)):
             for out_obj_id, out_mask in video_segments[out_frame_idx].items():
                 if out_obj_id != self.CLIMBER_OBJECT_ID:
@@ -200,8 +253,14 @@ class ChalkGpt:
                 out_mask = out_mask.squeeze()
                 bbox = get_bounding_box(mask=out_mask, pad=50)
                 frame: np.ndarray = cv2.imread(os.path.join(self.config.video_dir, frame_names[out_frame_idx]))
-                climber_crop = frame[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
-                cv2.imshow("climber crop", climber_crop)
+                world_frame_with_climber = np.array(world_frame)
+                world_frame_with_climber[self.H_ext:-self.H_ext,self.W_ext:-self.W_ext] = frame
+                T = self.transform_from_first_frame[frame_names[out_frame_idx]]
+                bbox.apply_transform(T=self.get_world_frame_placement_transform())
+                bbox.apply_transform(T=T)
+                world_frame_final = cv2.warpAffine(world_frame_with_climber, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
+                climber_crop = world_frame_final[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
+                cv2.imshow("climber crop", world_frame_final)
 
                 pose: ImagePoseEstimationPrediction = self.yolo_nas.predict(climber_crop, conf=0.3, fuse_model=False)
                 pose_draw = pose.draw()
@@ -237,22 +296,27 @@ class ChalkGpt:
         return torch.from_numpy(im / 255.).float()[None, None].to(self.config.device)
 
     def estimate_relative_motion(self, frame_names):
-        for i in range(0, len(frame_names)-1):
-            img_0 = self.image_to_tensor(cv2.imread(os.path.join(self.config.video_dir,frame_names[i])))
-            img_1 = self.image_to_tensor(cv2.imread(os.path.join(self.config.video_dir,frame_names[i+1])))
-
-            img0_det = self.detector({"image": img_0})
-            img1_det = self.detector({"image": img_1})
-            lightglue_input_dict = {"image0": self.get_lightlue_input(img0_det, img_0),
-                                    "image1": self.get_lightlue_input(img1_det, img_1)}
-            res = self.matcher(lightglue_input_dict)
-            a=3
+        for i in tqdm.tqdm(range(0, len(frame_names)-1), total=len(frame_names)):
+            tqdm.tqdm.write(f'Processing frame {i}')  # Display the current frame index
+            img_0 = cv2.imread(os.path.join(self.config.video_dir,frame_names[0]))
+            img_1 = cv2.imread(os.path.join(self.config.video_dir,frame_names[i+1]))
+            img_0_tensor: torch.Tensor = self.image_to_tensor(img_0)
+            img_1_tensor: torch.Tensor = self.image_to_tensor(img_1)
+            img0_det = self.detector({"image": img_0_tensor})
+            img1_det = self.detector({"image": img_1_tensor})
+            lightglue_input_dict = {"image0": self.get_lightlue_input(img0_det, img_0_tensor),
+                                    "image1": self.get_lightlue_input(img1_det, img_1_tensor)}
+            lightlue_output = self.matcher(lightglue_input_dict)
+            matches = lightglue_to_opencv_matches(input_dict=lightglue_input_dict, lightlue_output=lightlue_output)
+            self.transform_from_first_frame[frame_names[i]] = estimate_relative_pose(matches)
+            # cv2.imshow("match",cv2.drawMatches(img_0, matches.img_0_kpts, img_1, matches.img_1_kpts, matches.matches, None))
+            # cv2.waitKey(100)
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
                                             try_to_load_from_disk=True,
                                             video_dir='downloaded_frames_tag',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
-                                            lightglue_match_threshold=.1)
+                                            lightglue_match_threshold=.995)
     chalk_gpt: ChalkGpt = ChalkGpt(config)
     chalk_gpt.main()
