@@ -2,7 +2,7 @@ import yt_dlp
 import cv2
 import os
 
-def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, force_download: bool = False):
+def download_frames(url, start_time, end_time, output_dir, resize_factor=5.0, force_download: bool = False):
 
     # Configure yt-dlp options
     ydl_opts = {
@@ -25,15 +25,18 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, 
 
     # Set the starting point
     fps = video.get(cv2.CAP_PROP_FPS)
-    video.set(cv2.CAP_PROP_POS_FRAMES, int(start_time * fps))
+    start_frame: int = int(start_time * fps)
+    video.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
 
     # Extract frames and display
     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-    for i in range(num_frames):
+    for i in range(total_frames):
         ret, frame = video.read()
+        if video.get(cv2.CAP_PROP_POS_FRAMES) > int(end_time*fps):
+            break
         if ret:
             # Resize frame
             new_width = int(frame.shape[1] / resize_factor)
@@ -49,9 +52,6 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, 
             # Wait for 30 ms and check if user wants to quit
             if cv2.waitKey(30) & 0xFF == ord('q'):
                 break
-        # else:
-        #     print(f"Could only extract {i} frames.")
-        #     break
 
     # Clean up
     video.release()
@@ -60,10 +60,10 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, 
 if __name__ == "__main__":
 
 # Usage
-    url = '/home/gabi/GitHub/Experiments/segment-anything-2/romi.mp4'
-    start_time = 0  # 22:27 in seconds
-    num_frames = 500
-    output_dir = 'downloaded_frames_romi'
+    url = 'https://youtu.be/Lb8QkUemXiM?si=7_Pm7ANoeJB_lYtv'
+    start_time = 1*60+10  # 22:27 in seconds
+    num_frames = 1*60+30
+    output_dir = 'bldr2'
 
-    download_frames(url, start_time, num_frames, output_dir, force_download=True, resize_factor=2)
+    download_frames(url, start_time, num_frames, output_dir, force_download=True, resize_factor=1)
 

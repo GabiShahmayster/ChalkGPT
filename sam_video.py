@@ -97,6 +97,8 @@ class ChalkGptConfig:
     images_dir: str = None
     video_file: str = None
     superglue_model: str = 'outdoor'
+    mask_for_matching: bool = False
+    max_frames: int = None
 
     def __post_init__(self):
         assert self.images_dir is not None or self.video_file is not None, "must provide video/frames path"
@@ -212,6 +214,8 @@ class ChalkGpt:
             if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", ".png"]
         ]
         frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+        if self.config.max_frames is not None:
+            frame_names = frame_names[:self.config.max_frames]
         return frame_names
 
     def process_frames(self, frame_names):
@@ -233,6 +237,8 @@ class ChalkGpt:
 
         video_segments = {}
         for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(inference_state):
+            if self.config.max_frames is not None and out_frame_idx > self.config.max_frames:
+                break
             video_segments[out_frame_idx] = {
                 out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
                 for i, out_obj_id in enumerate(out_obj_ids)
@@ -274,7 +280,13 @@ class ChalkGpt:
                 bbox = get_bounding_box(mask=out_mask, pad=50)
                 frame: np.ndarray = cv2.imread(os.path.join(self.config.images_dir, frame_names[out_frame_idx]))
                 world_frame_with_climber = np.array(world_frame)
-                world_frame_with_climber[self.H_ext:-self.H_ext,self.W_ext:-self.W_ext] = frame
+                end_row = world_frame_with_climber.shape[0]
+                if self.H_ext != 0:
+                    end_row = -self.H_ext
+                end_col = world_frame_with_climber.shape[1]
+                if self.W_ext != 0:
+                    end_col = -self.W_ext
+                world_frame_with_climber[self.H_ext:end_row,self.W_ext:end_col] = frame
                 T = self.transform_from_first_frame[frame_names[out_frame_idx]]
                 bbox.apply_transform(T=self.get_world_frame_placement_transform())
                 bbox.apply_transform(T=T)
@@ -321,7 +333,10 @@ class ChalkGpt:
                 continue
             out_mask = out_mask.squeeze()
         im = cv2.imread(os.path.join(self.config.images_dir, frame_names[frame_idx]), cv2.IMREAD_GRAYSCALE)
-        return (~out_mask).astype(np.uint8) * im
+        if self.config.mask_for_matching:
+            return (~out_mask).astype(np.uint8) * im
+        else:
+            return im
 
     def estimate_relative_motion(self, video_segments, frame_names):
         ref_img = self.get_masked_image(video_segments=video_segments, frame_names=frame_names, frame_idx=0)
@@ -338,11 +353,13 @@ class ChalkGpt:
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
                                             try_to_load_from_disk=True,
-                                            images_dir='downloaded_frames_tag',
+                                            images_dir='bldr2',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
                                             matcher_threshold=.9,
                                             detector_threshold=.1,
-                                            superglue_model='outdoor')
+                                            superglue_model='outdoor',
+                                            mask_for_matching=False,
+                                            max_frames=100)
     chalk_gpt: ChalkGpt = ChalkGpt(config)
     chalk_gpt.main()
