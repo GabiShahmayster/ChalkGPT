@@ -41,11 +41,19 @@
 # %BANNER_END%
 
 from pathlib import Path
-from typing import Dict, List, Tuple
 
-import cv2
+import numpy as np
+
 import torch
 from torch import nn
+
+from src.base import KeypointData
+
+def frame2tensor(frame, device, convert_to_grayscale: bool=False):
+    if convert_to_grayscale:
+        return torch.from_numpy(frame / 255.).float()[None, None].to(device)
+    else:
+        return torch.from_numpy(frame / 255.).float().unsqueeze(0).permute((0, 3, 1, 2)).to(device)
 
 def simple_nms(scores, nms_radius: int):
     """ Fast Non-maximum suppression to remove nearby points """
@@ -109,10 +117,13 @@ class SuperPoint(nn.Module):
         'keypoint_threshold': 0.005,
         'max_keypoints': -1,
         'remove_borders': 4,
+        'min_score': 0.05,
     }
+    verbose: bool
 
-    def __init__(self, config):
+    def __init__(self, config, verbose: bool = False):
         super().__init__()
+        self.verbose = verbose
         self.config = {**self.default_config, **config}
 
         self.relu = nn.ReLU(inplace=True)
@@ -136,19 +147,20 @@ class SuperPoint(nn.Module):
             c5, self.config['descriptor_dim'],
             kernel_size=1, stride=1, padding=0)
 
-        path = Path(__file__).parent / 'assets' / 'superpoint_v1.pth'
+        path = Path(__file__).parent.parent / 'assets/weights/superpoint_v1.pth'
         self.load_state_dict(torch.load(str(path)))
 
         mk = self.config['max_keypoints']
         if mk == 0 or mk < -1:
             raise ValueError('\"max_keypoints\" must be positive or \"-1\"')
 
-        print('Loaded SuperPoint model')
+        if self.verbose:
+            print('Loaded SuperPoint model')
 
-    def forward(self, data):
+    def forward(self, image):
         """ Compute keypoints, scores, descriptors for image """
         # Shared Encoder
-        x = self.relu(self.conv1a(data['image']))
+        x = self.relu(self.conv1a(image))
         x = self.relu(self.conv1b(x))
         x = self.pool(x)
         x = self.relu(self.conv2a(x))
@@ -198,45 +210,18 @@ class SuperPoint(nn.Module):
         descriptors = [sample_descriptors(k[None], d[None], 8)[0]
                        for k, d in zip(keypoints, descriptors)]
 
-        return {
-            'keypoints': keypoints,
-            'scores': scores,
-            'descriptors': descriptors,
-        }
-
-def frame2tensor_grayscale(frame, device):
-    return torch.from_numpy(frame / 255.).float()[None, None].to(device)
-
-def frame2tensor(frame, device, convert_to_grayscale: bool):
-    if convert_to_grayscale:
-        return torch.from_numpy(frame / 255.).float()[None, None].to(device)
-    else:
-        return torch.from_numpy(frame / 255.).float().unsqueeze(0).permute((0, 3, 1, 2)).to(device)
+        return keypoints, scores, descriptors
 
 
-def get_image_as_tensor(image_path: str, device, convert_to_grayscale: bool = True) -> torch.Tensor:
-    img = cv2.imread(image_path)
-    if convert_to_grayscale:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    img_tensor = frame2tensor(img, device, convert_to_grayscale)
-    img_tensor = img_tensor.to(device)
-    return img_tensor
+    def detectAndCompute(self, image: np.array, device: torch.device = torch.device("cpu"), mask=None) -> KeypointData:
+        with torch.no_grad():
+            image_tensor: torch.Tensor = frame2tensor(image, device, True)
+            if mask:
+                raise NotImplemented('Masking is not implemented')
+            keypoints, scores, descriptors = self(image_tensor)
 
-def get_superpoint_scores(superpoint_output: Dict) -> List[float]:
-    return superpoint_output['scores'][0].detach().cpu().numpy()
-
-def get_superpoint_keypoints_as_opencv_keypoints(superpoint_output: Dict,
-                                                 min_score: float = .0) -> Tuple[cv2.KeyPoint]:
-    kpts = superpoint_output['keypoints'][0].detach().cpu().numpy()
-    scores = superpoint_output['scores'][0].detach().cpu().numpy()
-    out: List[cv2.KeyPoint] = []
-    for score, kpt in zip(scores, kpts):
-        if score < min_score:
-            continue
-        kpt_opencv: cv2.KeyPoint = cv2.KeyPoint()
-        kpt_opencv.pt = (kpt[0], kpt[1])
-        out.append(kpt_opencv)
-    return tuple(out)
-
-def get_superpoint_descriptors_as_opencv_descriptors(superpoint_output: Dict) -> List[cv2.KeyPoint]:
-    return superpoint_output['descriptors'][0].detach().cpu().numpy().T
+            kpts = keypoints[0].detach()
+            scores = scores[0].detach()
+            dsc = descriptors[0].detach().T
+            output = KeypointData(image=image, keypoints_tensor=kpts, descriptors_tensor=dsc, scores_tensor=scores)
+            return output

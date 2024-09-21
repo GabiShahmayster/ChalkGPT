@@ -60,10 +60,10 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, 
 if __name__ == "__main__":
 
 # Usage
-    url = 'https://www.youtube.com/watch?v=gtIGgs_y2nY&t=11s'
-    start_time = 4*60+12  # 22:27 in seconds
+    url = '/home/gabi/GitHub/Experiments/segment-anything-2/romi.mp4'
+    start_time = 0  # 22:27 in seconds
     num_frames = 500
-    output_dir = 'downloaded_frames_tag2'
+    output_dir = 'downloaded_frames_romi'
 
     download_frames(url, start_time, num_frames, output_dir, force_download=True, resize_factor=2)
 
