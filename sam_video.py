@@ -150,6 +150,11 @@ def estimate_relative_pose(matching_results: KeypointMatchingResults) -> np.ndar
     mat[:2,:2] /= s
     return mat
 
+class TrackedObjectType(enum.Enum):
+    Climber = 0
+    Wall = 1
+    Holds = 2
+
 class ChalkGpt:
     config: ChalkGptConfig
     predictor: object
@@ -157,6 +162,7 @@ class ChalkGpt:
 
     CLIMBER_OBJECT_ID = 1
     WALL_OBJECT_ID = 2
+    HOLDS_OBJECT_ID = 3
     transform_from_first_frame: Dict[str, np.ndarray]
     H_ext: int
     W_ext: int
@@ -218,23 +224,43 @@ class ChalkGpt:
             frame_names = frame_names[:self.config.max_frames]
         return frame_names
 
-    def process_frames(self, frame_names):
-        climber_manual_select = select_pixel(image=cv2.imread(os.path.join(config.images_dir, frame_names[0])))
-        inference_state = self.predictor.init_state(video_path=self.config.images_dir, offload_video_to_cpu=True,
-                                                    offload_state_to_cpu=True)
+    def manually_select_object(self, inference_state, tracked_obj: TrackedObjectType, frame_idx: int, frame_names: List[str]):
+        if tracked_obj is TrackedObjectType.Climber:
+            label: str = 'select climber'
+            object_id: int = self.CLIMBER_OBJECT_ID
+        elif tracked_obj is TrackedObjectType.Wall:
+            label: str = 'select wall'
+            object_id: int = self.WALL_OBJECT_ID
+        elif tracked_obj is TrackedObjectType.Holds:
+            label: str = 'select hold'
+            object_id: int = self.HOLDS_OBJECT_ID
 
-        ann_frame_idx = 0
-        ann_obj_id = self.CLIMBER_OBJECT_ID
-        points = np.array([climber_manual_select], dtype=np.float32)
-        labels = np.array([self.CLIMBER_OBJECT_ID], np.int32)
+        selected_points = select_pixel(image=cv2.imread(os.path.join(config.images_dir, frame_names[frame_idx])), label=label)
+        """
+        segment multipleo objects
+        https://github.com/roboflow/rf-segment-anything-2/blob/main/notebooks/video_predictor_example.ipynb
+        """
+        points = np.array([selected_points], dtype=np.float32).squeeze()
+        if len(points.shape) == 1:
+            points = points.reshape((1,2))
+        labels = object_id * np.ones(len(selected_points), dtype=np.int32)
+        if len(labels.shape) == 1:
+            labels = labels.reshape((1,-1))
         _, out_obj_ids, out_mask_logits = self.predictor.add_new_points(
             inference_state=inference_state,
-            frame_idx=ann_frame_idx,
-            obj_id=ann_obj_id,
+            frame_idx=frame_idx,
+            obj_id=object_id,
             points=points,
             labels=labels,
         )
 
+    def process_frames(self, frame_names):
+        inference_state = self.predictor.init_state(video_path=self.config.images_dir, offload_video_to_cpu=True,
+                                                    offload_state_to_cpu=True)
+        self.manually_select_object(inference_state, tracked_obj=TrackedObjectType.Climber, frame_idx=0,
+                                    frame_names=frame_names)
+        self.manually_select_object(inference_state, tracked_obj=TrackedObjectType.Holds, frame_idx=0,
+                                    frame_names=frame_names)
         video_segments = {}
         for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(inference_state):
             if self.config.max_frames is not None and out_frame_idx > self.config.max_frames:
@@ -273,41 +299,44 @@ class ChalkGpt:
     def visualize(self, video_segments, frame_names):
         world_frame: np.ndarray = self.get_world_frame(frame_names)
         for out_frame_idx in range(0, len(frame_names)):
+            frame: np.ndarray = cv2.imread(os.path.join(self.config.images_dir, frame_names[out_frame_idx]))
+            raw_frame = np.array(frame)
+            blended_frame = np.array(frame)
             for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-                if out_obj_id != self.CLIMBER_OBJECT_ID:
-                    continue
                 out_mask = out_mask.squeeze()
-                bbox = get_bounding_box(mask=out_mask, pad=50)
-                frame: np.ndarray = cv2.imread(os.path.join(self.config.images_dir, frame_names[out_frame_idx]))
-                world_frame_with_climber = np.array(world_frame)
-                end_row = world_frame_with_climber.shape[0]
-                if self.H_ext != 0:
-                    end_row = -self.H_ext
-                end_col = world_frame_with_climber.shape[1]
-                if self.W_ext != 0:
-                    end_col = -self.W_ext
-                world_frame_with_climber[self.H_ext:end_row,self.W_ext:end_col] = frame
-                T = self.transform_from_first_frame[frame_names[out_frame_idx]]
-                bbox.apply_transform(T=self.get_world_frame_placement_transform())
-                bbox.apply_transform(T=T)
-                world_frame_final = cv2.warpAffine(world_frame_with_climber, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
-                climber_crop = world_frame_final[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
-                cv2.imshow("climber crop", world_frame_final)
+                if out_obj_id == self.HOLDS_OBJECT_ID:
+                    mask_3d = np.stack((0 * out_mask, out_mask, 0 * out_mask), axis=2).astype(np.uint8)
+                    blended_frame = cv2.blendLinear(blended_frame, 255 * mask_3d, 0.5 * np.ones_like(out_mask, dtype=np.float32),0.5 * np.ones_like(out_mask, dtype=np.float32))
+                elif out_obj_id == self.CLIMBER_OBJECT_ID:
+                    bbox = get_bounding_box(mask=out_mask, pad=50)
+                    world_frame_with_climber = np.array(world_frame)
+                    end_row = world_frame_with_climber.shape[0]
+                    if self.H_ext != 0:
+                        end_row = -self.H_ext
+                    end_col = world_frame_with_climber.shape[1]
+                    if self.W_ext != 0:
+                        end_col = -self.W_ext
+                    world_frame_with_climber[self.H_ext:end_row,self.W_ext:end_col] = raw_frame
+                    T = self.transform_from_first_frame[frame_names[out_frame_idx]]
+                    bbox.apply_transform(T=self.get_world_frame_placement_transform())
+                    bbox.apply_transform(T=T)
+                    world_frame_final = cv2.warpAffine(world_frame_with_climber, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
+                    climber_crop = world_frame_final[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
+                    cv2.imshow("climber crop", world_frame_final)
 
-                pose: ImagePoseEstimationPrediction = self.yolo_nas.predict(climber_crop, conf=0.3, fuse_model=False)
-                pose_draw = pose.draw()
-                cv2.imshow("climber pose", pose_draw)
+                    pose: ImagePoseEstimationPrediction = self.yolo_nas.predict(climber_crop, conf=0.3, fuse_model=False)
+                    pose_draw = pose.draw()
+                    cv2.imshow("climber pose", pose_draw)
+                    mask_3d = np.stack((0 * out_mask, 0 * out_mask, out_mask), axis=2).astype(np.uint8)
+                    blended_frame = cv2.blendLinear(blended_frame, 255 * mask_3d, 0.5 * np.ones_like(out_mask, dtype=np.float32),
+                                            0.5 * np.ones_like(out_mask, dtype=np.float32))
 
-                mask_3d = np.stack((0 * out_mask, 0 * out_mask, out_mask), axis=2).astype(np.uint8)
-                blend = cv2.blendLinear(frame, 255 * mask_3d, 0.5 * np.ones_like(out_mask, dtype=np.float32),
-                                        0.5 * np.ones_like(out_mask, dtype=np.float32))
+            cv2.imshow("blended frame", blended_frame)
 
-                cv2.imshow("blended frame", blend)
-
-                while True:
-                     key = cv2.waitKey(1) & 0xFF
-                     if key == 32:  # 32 is the ASCII code for spacebar
-                        break
+            while True:
+                 key = cv2.waitKey(1) & 0xFF
+                 if key == 32:  # 32 is the ASCII code for spacebar
+                    break
 
     def get_lightlue_input(self, detector_output: Dict, image: torch.Tensor):
         """
@@ -353,7 +382,7 @@ class ChalkGpt:
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
                                             try_to_load_from_disk=True,
-                                            images_dir='bldr2',
+                                            images_dir='downloaded_frames_tag',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
                                             matcher_threshold=.9,
