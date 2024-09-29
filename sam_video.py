@@ -324,7 +324,7 @@ class ChalkGpt:
                     climber_crop = world_frame_final[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
                     cv2.imshow("climber crop", world_frame_final)
 
-                    pose: ImagePoseEstimationPrediction = self.yolo_nas.predict(climber_crop, conf=0.3, fuse_model=False)
+                    pose: ImagePoseEstimationPrediction = self.yolo_nas.predict(climber_crop, conf=0.3, fuse_model=False, batch_size=1)
                     pose_draw = pose.draw()
                     cv2.imshow("climber pose", pose_draw)
                     mask_3d = np.stack((0 * out_mask, 0 * out_mask, out_mask), axis=2).astype(np.uint8)
@@ -381,7 +381,7 @@ class ChalkGpt:
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
-                                            try_to_load_from_disk=True,
+                                            try_to_load_from_disk=False,
                                             images_dir='downloaded_frames_tag',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
@@ -389,6 +389,6 @@ if __name__ == "__main__":
                                             detector_threshold=.1,
                                             superglue_model='outdoor',
                                             mask_for_matching=False,
-                                            max_frames=100)
+                                            max_frames=None)
     chalk_gpt: ChalkGpt = ChalkGpt(config)
     chalk_gpt.main()
