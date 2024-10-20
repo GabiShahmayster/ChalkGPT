@@ -14,6 +14,7 @@ import tqdm
 from matplotlib import pyplot as plt
 from PIL import Image
 from super_gradients.training.utils.predict import ImagePoseEstimationPrediction
+from ultralytics import YOLO
 
 from lightglue import LightGlue
 from mouse_click import select_pixel
@@ -159,6 +160,8 @@ class ChalkGpt:
     config: ChalkGptConfig
     predictor: object
     pose_estimator: object
+    yolo_pose: object
+    yolo_holds: object
 
     CLIMBER_OBJECT_ID = 1
     WALL_OBJECT_ID = 2
@@ -173,8 +176,10 @@ class ChalkGpt:
         model_cfg = "sam2_hiera_s.yaml"
         self.predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
 
-        self.yolo_nas = super_gradients.training.models.get("yolo_nas_pose_l", pretrained_weights="coco_pose").cuda()
-        self.yolo_nas.eval()
+        self.yolo_pose = super_gradients.training.models.get("yolo_nas_pose_l", pretrained_weights="coco_pose").cuda()
+        self.yolo_pose.eval()
+
+        self.yolo_holds = YOLO("runs/detect/train7/weights/best.pt")
 
         superpoint_config = {'keypoint_threshold':self.config.detector_threshold}
         superglue_config = {'weights':self.config.superglue_model,
@@ -224,6 +229,27 @@ class ChalkGpt:
             frame_names = frame_names[:self.config.max_frames]
         return frame_names
 
+    def localize_holds_using_yolo(self, inference_state, frame_idx: int, frame_names: List[str]):
+        resuts = self.yolo_holds(os.path.join(config.images_dir, frame_names[frame_idx]))[0]
+        bboxes = resuts.boxes[resuts.boxes.conf>0.5]
+        points = np.empty((len(bboxes), 2), dtype=np.float32)
+        labels = self.HOLDS_OBJECT_ID * np.ones(len(bboxes), dtype=np.int32)
+        for idx, bbox in enumerate(bboxes):
+            xywh = bbox.xywh.cpu().numpy().squeeze()
+            points[idx] = xywh[:2]
+            # points = np.array([selected_points], dtype=np.float32).squeeze()
+            # if len(points.shape) == 1:
+            #     points = points.reshape((1,2))
+        if len(labels.shape) == 1:
+            labels = labels.reshape((1,-1))
+        _, out_obj_ids, out_mask_logits = self.predictor.add_new_points(
+            inference_state=inference_state,
+            frame_idx=frame_idx,
+            obj_id=self.HOLDS_OBJECT_ID,
+            points=points,
+            labels=labels,
+        )
+
     def manually_select_object(self, inference_state, tracked_obj: TrackedObjectType, frame_idx: int, frame_names: List[str]):
         if tracked_obj is TrackedObjectType.Climber:
             label: str = 'select climber'
@@ -259,8 +285,8 @@ class ChalkGpt:
                                                     offload_state_to_cpu=True)
         self.manually_select_object(inference_state, tracked_obj=TrackedObjectType.Climber, frame_idx=0,
                                     frame_names=frame_names)
-        self.manually_select_object(inference_state, tracked_obj=TrackedObjectType.Holds, frame_idx=0,
-                                    frame_names=frame_names)
+        # self.localize_holds_using_yolo(inference_state, frame_idx=0,
+        #                             frame_names=frame_names)
         video_segments = {}
         for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(inference_state):
             if self.config.max_frames is not None and out_frame_idx > self.config.max_frames:
@@ -301,12 +327,13 @@ class ChalkGpt:
         for out_frame_idx in range(0, len(frame_names)):
             frame: np.ndarray = cv2.imread(os.path.join(self.config.images_dir, frame_names[out_frame_idx]))
             raw_frame = np.array(frame)
-            blended_frame = np.array(frame)
+            blended_frame = self.yolo_holds(os.path.join(self.config.images_dir, frame_names[out_frame_idx]))[0].plot()
             for out_obj_id, out_mask in video_segments[out_frame_idx].items():
                 out_mask = out_mask.squeeze()
                 if out_obj_id == self.HOLDS_OBJECT_ID:
-                    mask_3d = np.stack((0 * out_mask, out_mask, 0 * out_mask), axis=2).astype(np.uint8)
-                    blended_frame = cv2.blendLinear(blended_frame, 255 * mask_3d, 0.5 * np.ones_like(out_mask, dtype=np.float32),0.5 * np.ones_like(out_mask, dtype=np.float32))
+                    pass
+                    # mask_3d = np.stack((0 * out_mask, out_mask, 0 * out_mask), axis=2).astype(np.uint8)
+                    # blended_frame = cv2.blendLinear(blended_frame, 255 * mask_3d, 0.5 * np.ones_like(out_mask, dtype=np.float32),0.5 * np.ones_like(out_mask, dtype=np.float32))
                 elif out_obj_id == self.CLIMBER_OBJECT_ID:
                     bbox = get_bounding_box(mask=out_mask, pad=50)
                     world_frame_with_climber = np.array(world_frame)
@@ -324,7 +351,7 @@ class ChalkGpt:
                     climber_crop = world_frame_final[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
                     cv2.imshow("climber crop", world_frame_final)
 
-                    pose: ImagePoseEstimationPrediction = self.yolo_nas.predict(climber_crop, conf=0.3, fuse_model=False, batch_size=1)
+                    pose: ImagePoseEstimationPrediction = self.yolo_pose.predict(climber_crop, conf=0.3, fuse_model=False, batch_size=1)
                     pose_draw = pose.draw()
                     cv2.imshow("climber pose", pose_draw)
                     mask_3d = np.stack((0 * out_mask, 0 * out_mask, out_mask), axis=2).astype(np.uint8)
@@ -368,7 +395,7 @@ class ChalkGpt:
             return im
 
     def estimate_relative_motion(self, video_segments, frame_names):
-        ref_img = self.get_masked_image(video_segments=video_segments, frame_names=frame_names, frame_idx=0)
+        ref_img = self.get_masked_image(video_segments=video_segments, frame_names=frame_names, frame_idx=len(frame_names)//2)
         ref_img_kpts: KeypointData = self.detector.detectAndCompute(ref_img, self.config.device)
         for i in tqdm.tqdm(range(0, len(frame_names)-1), total=len(frame_names)):
             tqdm.tqdm.write(f'Processing frame {i}')  # Display the current frame index
@@ -381,8 +408,8 @@ class ChalkGpt:
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
-                                            try_to_load_from_disk=False,
-                                            images_dir='downloaded_frames_tag',
+                                            try_to_load_from_disk=True,
+                                            images_dir='downloaded_frames_tag2',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
                                             matcher_threshold=.9,
