@@ -21,7 +21,7 @@ class TestVideoWriterAux(unittest.TestCase):
         os.rmdir(self.temp_dir)
 
     def test_predict_yolo_v11(self):
-        model = YOLO("runs/detect/train7/weights/best.pt")  # load a pretrained model (recommended for training)
+        model = YOLO("weights/v0/weights/best.pt")  # load a pretrained model (recommended for training)
         for im in glob.glob("/home/gabi/Datasets/ClimbingHolds/test/images/*.jpg"):
             results = model(im)  # return a list of Results objects
 
@@ -34,15 +34,25 @@ class TestVideoWriterAux(unittest.TestCase):
                 obb = result.obb  # Oriented boxes object for OBB outputs
                 result.show()  # display to screen
 
-    def test_train_yolo_v11(self):
+    def test_train_yolo_v11_holds(self):
         import comet_ml
 
         comet_ml.init(api_key="nF5qlywvVU26jsRXDepkJ48hM", project_name="climbing_holds")
         # Load a model
-        model = YOLO("yolo11n.pt")  # load a pretrained model (recommended for training)
+        model = YOLO("yolo11s.pt")  # load a pretrained model (recommended for training)
         # Train the model
         with keep.running():
-            results = model.train(data="/home/gabi/Datasets/ClimbingHolds/data.yaml", epochs=100, imgsz=400)
+            results = model.train(data="/home/gabi/Datasets/ClimbingHolds/data.yaml", epochs=300, imgsz=640, dropout=0.5)
+
+    def test_train_yolo_v11_shoes(self):
+        import comet_ml
+
+        comet_ml.init(api_key="nF5qlywvVU26jsRXDepkJ48hM", project_name="climbing_shoes")
+        # Load a model
+        model = YOLO("yolo11s.pt")  # load a pretrained model (recommended for training)
+        # Train the model
+        with keep.running():
+            results = model.train(data="/home/gabi/Datasets/ClimbingShoes/data.yaml", epochs=300, imgsz=640, dropout=0.5)
 
     def test_video_writer_aux(self):
         # Create a VideoWriterAux instance

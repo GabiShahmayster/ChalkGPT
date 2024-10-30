@@ -85,7 +85,7 @@ def build_sam2_hf(model_id, **kwargs):
     model_id_to_filenames = {
         "facebook/sam2-hiera-tiny": ("sam2_hiera_t.yaml", "sam2_hiera_tiny.pt"),
         "facebook/sam2-hiera-small": ("sam2_hiera_s.yaml", "sam2_hiera_small.pt"),
-        "facebook/sam2-hiera-base-plus": (
+        "facebook/sam2-hiera-v0-plus": (
             "sam2_hiera_b+.yaml",
             "sam2_hiera_base_plus.pt",
         ),
@@ -103,7 +103,7 @@ def build_sam2_video_predictor_hf(model_id, **kwargs):
     model_id_to_filenames = {
         "facebook/sam2-hiera-tiny": ("sam2_hiera_t.yaml", "sam2_hiera_tiny.pt"),
         "facebook/sam2-hiera-small": ("sam2_hiera_s.yaml", "sam2_hiera_small.pt"),
-        "facebook/sam2-hiera-base-plus": (
+        "facebook/sam2-hiera-v0-plus": (
             "sam2_hiera_b+.yaml",
             "sam2_hiera_base_plus.pt",
         ),

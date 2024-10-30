@@ -345,7 +345,7 @@ class MatcherBaseClass(ABC):
 
     Notes
     -----
-    Subclasses should provide concrete implementations of the abstract methods defined in this base class.
+    Subclasses should provide concrete implementations of the abstract methods defined in this v0 class.
     """
 
     @abstractmethod
@@ -412,7 +412,7 @@ class MatcherBaseClass(ABC):
 
 class DetectorAndExtractor(ABC):
     """
-    Abstract base class for keypoint detectors and descriptor extractors.
+    Abstract v0 class for keypoint detectors and descriptor extractors.
 
     This class serves as a blueprint for implementations of keypoint detection and descriptor
     extraction algorithms. It defines the interface for detecting keypoints in an image and computing
@@ -425,7 +425,7 @@ class DetectorAndExtractor(ABC):
 
     Notes
     -----
-    Subclasses should provide concrete implementations of the abstract methods defined in this base class.
+    Subclasses should provide concrete implementations of the abstract methods defined in this v0 class.
     """
 
     @abstractmethod

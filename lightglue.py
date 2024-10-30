@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-# from src.features.base import MatcherBaseClass, KeypointData, KeypointMatchingResults
+# from src.features.v0 import MatcherBaseClass, KeypointData, KeypointMatchingResults
 
 try:
     from flash_attn.modules.mha import FlashCrossAttention
