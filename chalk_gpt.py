@@ -4,7 +4,7 @@ import os
 import pickle
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -12,6 +12,7 @@ import super_gradients
 import torch
 import tqdm
 import ultralytics.engine.results
+from img2vec_pytorch import Img2Vec
 from matplotlib import pyplot as plt
 from PIL import Image
 from super_gradients.training.utils.predict import ImagePoseEstimationPrediction
@@ -27,14 +28,19 @@ from dataclasses import dataclass
 from src.base import KeypointData, KeypointMatchingResults
 from src.superglue import SuperGlue
 from src.superpoint import SuperPoint
+from vector_db import FAISSIndex
 from video_extractor import extract_video_frames
 
-@dataclass
 class BoundingBox:
     top_left: tuple
     bottom_right: tuple
     width_px: int = None
     height_px: int = None
+    def __init__(self, top_left: tuple, bottom_right: tuple, width_px: int = None, height_px: int = None):
+        self.top_left = top_left
+        self.bottom_right =bottom_right
+        self.width_px = width_px
+        self.height_px = height_px
 
     def __post_init__(self):
         self.width_px = self.bottom_right[0] - self.top_left[0]
@@ -57,8 +63,30 @@ class BoundingBox:
     def get_image_crop(self, im: np.ndarray) -> np.ndarray:
         return im[self.top_left[1]:self.bottom_right[1],self.top_left[0]:self.bottom_right[0]]
 
-class Holds(BoundingBox):
-    pass
+class HoldBBox(BoundingBox):
+    id: int
+    embedding: torch.Tensor
+    global_uid: int = -1
+
+    def __init__(self, top_left: tuple, bottom_right: tuple, id: int,
+                 embedding: torch.Tensor = None, width_px: int = None, height_px: int = None):
+        BoundingBox.__init__(self,
+                             top_left=top_left,
+                             bottom_right=bottom_right,
+                             width_px=width_px,
+                             height_px=height_px)
+        self.id = id
+        self.embedding = embedding
+
+    @classmethod
+    def next_id(cls) -> int:
+        cls.global_uid += 1
+        return cls.global_uid
+
+    @classmethod
+    def from_ultralytics_bbox(cls, ultralytics_bbox) -> 'HoldBBox':
+        xyxy: Tuple[float] = tuple([int(i) for i in ultralytics_bbox.xyxy.cpu().numpy().squeeze()])
+        return HoldBBox(top_left=xyxy[:2],bottom_right=xyxy[2:], id=cls.next_id())
 
 def show_mask(mask, ax, obj_id=None, random_color=False):
     if random_color:
@@ -177,7 +205,7 @@ class TrackedObjectType(enum.Enum):
 class FrameData:
     id: int
     im_path: str
-    holds: List[Holds]
+    holds: List[HoldBBox]
     transform_to_world: np.ndarray
 
     def __init__(self, id: int, im_path: str):
@@ -193,6 +221,7 @@ class ChalkGpt:
     pose_estimator: object
     yolo_pose: object
     yolo_holds: object
+    vector_db: FAISSIndex
 
     CLIMBER_OBJECT_ID = 1
     WALL_OBJECT_ID = 2
@@ -210,9 +239,11 @@ class ChalkGpt:
         self.yolo_pose = super_gradients.training.models.get("yolo_nas_pose_l", pretrained_weights="coco_pose").cuda()
         self.yolo_pose.eval()
 
-        self.yolo_holds = YOLO("weights/holds/v1/weights/best.pt")
-        self.yolo_shoes = YOLO("weights/shoes/v0/weights/best.pt")
+        self.img2vec = Img2Vec(cuda=config.device is torch.device('cuda:0'), model='resnet-18')
+        self.vector_db = FAISSIndex(dimension=512, index_type='cosine')
 
+        self.yolo_holds = YOLO("weights/holds/v1/weights/best.pt")
+        # self.yolo_shoes = YOLO("weights/shoes/v0/weights/best.pt")
         superpoint_config = {'keypoint_threshold':self.config.detector_threshold}
         superglue_config = {'weights':self.config.superglue_model,
                             'match_threshold':self.config.matcher_threshold}
@@ -249,6 +280,7 @@ class ChalkGpt:
                     with open(output_path, 'wb') as f:
                         pickle.dump(save_data, f)
 
+            self.match_holds()
             self.transform_from_reference_frame = {}
             self.estimate_relative_motion(video_segments=video_segments, frame_names=frame_names)
             self.visualize(video_segments=video_segments, frame_names=frame_names)
@@ -367,10 +399,15 @@ class ChalkGpt:
         return out
 
     def find_holds(self, im_path: str):
+        im_bgr: np.ndarray = cv2.cvtColor(cv2.imread(im_path), cv2.COLOR_BGR2RGB)
         yolo_res: Results = self.yolo_holds(im_path)[0]
-        out: List[BoundingBox] = []
+        out: List[HoldBBox] = []
         for box in yolo_res.boxes:
-            out.append(BoundingBox.from_ultralytics_bbox(ultralytics_bbox=box))
+            box: HoldBBox = HoldBBox.from_ultralytics_bbox(ultralytics_bbox=box)
+            out.append(box)
+        embeddings = self.img2vec.get_vec([Image.fromarray(b.get_image_crop(im_bgr)) for b in out], tensor=True)
+        for embedding, box in zip(embeddings, out):
+            box.embedding = embedding.squeeze()
         return out
 
     def visualize(self, video_segments, frame_names):
@@ -445,8 +482,12 @@ class ChalkGpt:
         else:
             return im
 
+    def get_ref_frame_idx(self):
+        return len(self.frames_data) // 2
+
     def estimate_relative_motion(self, video_segments, frame_names):
-        ref_img = self.get_masked_image(video_segments=video_segments, frame_names=frame_names, frame_idx=len(frame_names)//2)
+        ref_frame_idx: int = self.get_ref_frame_idx()
+        ref_img = self.get_masked_image(video_segments=video_segments, frame_names=frame_names, frame_idx=ref_frame_idx)
         ref_img_kpts: KeypointData = self.detector.detectAndCompute(ref_img, self.config.device)
         for i in tqdm.tqdm(range(0, len(frame_names)-1), total=len(frame_names)):
             tqdm.tqdm.write(f'Processing frame {i}')  # Display the current frame index
@@ -456,6 +497,15 @@ class ChalkGpt:
             self.transform_from_reference_frame[frame_names[i]] = estimate_relative_pose(kp_matching_res)
             # cv2.imshow("match",cv2.drawMatches(img_0, matches.img_0_kpts, img_1, matches.img_1_kpts, matches.matches, None))
             # cv2.waitKey(100)
+
+    def match_holds(self):
+        # add reference holds to DB
+        ref_frame: FrameData = self.frames_data[self.get_ref_frame_idx()]
+        embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in ref_frame.holds])
+        ids = [hold.id for hold in ref_frame.holds]
+        self.vector_db.add_vectors(vectors=embeddings, ids=ids)
+
+
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
