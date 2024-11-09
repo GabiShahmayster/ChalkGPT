@@ -63,12 +63,89 @@ class BoundingBox:
     def get_image_crop(self, im: np.ndarray) -> np.ndarray:
         return im[self.top_left[1]:self.bottom_right[1],self.top_left[0]:self.bottom_right[0]]
 
+    def draw_on_image(self,
+            im: np.ndarray,
+            color: Tuple[int, int, int] = (0, 255, 0),  # Default green color
+            thickness: int = 2,
+            label: str = None,
+            font_scale: float = 0.5,
+            text_color: Tuple[int, int, int] = (255, 255, 255),  # White text
+            text_thickness: int = 1
+    ) -> np.ndarray:
+        """
+        Draw a bounding box on an image using OpenCV.
+
+        Args:
+            image (np.ndarray): Input image (BGR format)
+            bbox (BoundingBox): Bounding box object with top_left and bottom_right coordinates
+            color (Tuple[int, int, int]): Box color in BGR format
+            thickness (int): Line thickness
+            label (str, optional): Label to display above the box
+            font_scale (float): Font scale for the label
+            text_color (Tuple[int, int, int]): Text color in BGR format
+            text_thickness (int): Text thickness
+
+        Returns:
+            np.ndarray: Image with drawn bounding box
+        """
+        # Make a copy to avoid modifying the original image
+        img_with_box = im.copy()
+
+        # Extract coordinates
+        x1, y1 = self.top_left
+        x2, y2 = self.bottom_right
+
+        # Ensure coordinates are integers
+        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+
+        # Draw the bounding box
+        img_with_box = cv2.rectangle(
+            img_with_box,
+            (x1, y1),
+            (x2, y2),
+            color,
+            thickness
+        )
+
+        # If a label is provided, draw it
+        if label:
+            # Calculate text size to create background rectangle
+            (text_width, text_height), baseline = cv2.getTextSize(
+                label,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                text_thickness
+            )
+
+            # Draw background rectangle for text
+            cv2.rectangle(
+                img_with_box,
+                (x1, y1 - text_height - baseline - 5),
+                (x1 + text_width, y1),
+                color,
+                -1  # Fill rectangle
+            )
+
+            # Draw text
+            cv2.putText(
+                img_with_box,
+                label,
+                (x1, y1 - baseline - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                text_color,
+                text_thickness
+            )
+
+        return img_with_box
+
+
 class HoldBBox(BoundingBox):
     id: int
     embedding: torch.Tensor
     global_uid: int = -1
 
-    def __init__(self, top_left: tuple, bottom_right: tuple, id: int,
+    def __init__(self, top_left: tuple, bottom_right: tuple, id: int = None,
                  embedding: torch.Tensor = None, width_px: int = None, height_px: int = None):
         BoundingBox.__init__(self,
                              top_left=top_left,
@@ -86,7 +163,7 @@ class HoldBBox(BoundingBox):
     @classmethod
     def from_ultralytics_bbox(cls, ultralytics_bbox) -> 'HoldBBox':
         xyxy: Tuple[float] = tuple([int(i) for i in ultralytics_bbox.xyxy.cpu().numpy().squeeze()])
-        return HoldBBox(top_left=xyxy[:2],bottom_right=xyxy[2:], id=cls.next_id())
+        return HoldBBox(top_left=xyxy[:2],bottom_right=xyxy[2:])
 
 def show_mask(mask, ax, obj_id=None, random_color=False):
     if random_color:
@@ -212,6 +289,8 @@ class FrameData:
         self.id = id
         self.im_path = im_path
 
+    def get_image(self) -> np.ndarray:
+        return cv2.imread(self.im_path)
 
 class ChalkGpt:
     frames_data: Dict[int, FrameData]
@@ -280,9 +359,9 @@ class ChalkGpt:
                     with open(output_path, 'wb') as f:
                         pickle.dump(save_data, f)
 
-            self.match_holds()
             self.transform_from_reference_frame = {}
             self.estimate_relative_motion(video_segments=video_segments, frame_names=frame_names)
+            self.match_holds()
             self.visualize(video_segments=video_segments, frame_names=frame_names)
 
     def init_frames(self):
@@ -353,7 +432,7 @@ class ChalkGpt:
 
     def find_holds_all_frames(self, frame_names):
         for frame_id, frame_data in tqdm.tqdm(self.frames_data.items(), total=len(self.frames_data)):
-            frame_data.holds = self.find_holds(im_path=frame_data.im_path)
+            frame_data.holds = self.detect_holds(im_path=frame_data.im_path)
 
     def process_frames(self, frame_names):
         inference_state = self.predictor.init_state(video_path=self.config.images_dir, offload_video_to_cpu=True,
@@ -398,7 +477,7 @@ class ChalkGpt:
         out[1, 2] = self.H_ext
         return out
 
-    def find_holds(self, im_path: str):
+    def detect_holds(self, im_path: str):
         im_bgr: np.ndarray = cv2.cvtColor(cv2.imread(im_path), cv2.COLOR_BGR2RGB)
         yolo_res: Results = self.yolo_holds(im_path)[0]
         out: List[HoldBBox] = []
@@ -416,6 +495,9 @@ class ChalkGpt:
             frame: np.ndarray = cv2.imread(os.path.join(self.config.images_dir, frame_names[out_frame_idx]))
             raw_frame = np.array(frame)
             blended_frame = np.array(raw_frame)
+            for hold in self.frames_data[out_frame_idx].holds:
+                blended_frame = hold.draw_on_image(blended_frame, label=f'{hold.id}')
+
             for out_obj_id, out_mask in video_segments[out_frame_idx].items():
                 out_mask = out_mask.squeeze()
                 if out_obj_id == self.HOLDS_OBJECT_ID:
@@ -501,9 +583,22 @@ class ChalkGpt:
     def match_holds(self):
         # add reference holds to DB
         ref_frame: FrameData = self.frames_data[self.get_ref_frame_idx()]
-        embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in ref_frame.holds])
-        ids = [hold.id for hold in ref_frame.holds]
-        self.vector_db.add_vectors(vectors=embeddings, ids=ids)
+        ref_holds: List[HoldBBox] = ref_frame.holds
+        embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in ref_holds])
+        for id, hold in enumerate(ref_holds):
+            hold.id = id
+
+        # ids = [hold.id for hold in ref_frame.holds]
+        self.vector_db.add_vectors(vectors=embeddings)
+        # distances, indices, metadata = self.vector_db.search(embeddings, k=1)
+        for frame_id, frame_data in self.frames_data.items():
+            # get holds embeddings
+            target_holds: List[HoldBBox] = frame_data.holds
+            embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in target_holds])
+            distances, indices, metadata = self.vector_db.search(embeddings, k=1)
+            for targ_hold_idx, ref_hold_idx in enumerate(indices.squeeze()):
+                target_holds[targ_hold_idx].id = ref_holds[ref_hold_idx].id
+
 
 
 
