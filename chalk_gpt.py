@@ -139,14 +139,17 @@ class BoundingBox:
 
         return img_with_box
 
+    def get_center(self) -> np.ndarray:
+        return 1/2*(np.array(self.top_left)+np.array(self.bottom_right[0]))
 
 class HoldBBox(BoundingBox):
     id: int
     embedding: torch.Tensor
     global_uid: int = -1
+    is_near_climber: bool = False
 
     def __init__(self, top_left: tuple, bottom_right: tuple, id: int = None,
-                 embedding: torch.Tensor = None, width_px: int = None, height_px: int = None):
+                 embedding: torch.Tensor = None, width_px: int = None, height_px: int = None, is_near_climber: bool = False):
         BoundingBox.__init__(self,
                              top_left=top_left,
                              bottom_right=bottom_right,
@@ -154,6 +157,7 @@ class HoldBBox(BoundingBox):
                              height_px=height_px)
         self.id = id
         self.embedding = embedding
+        self.is_near_climber = is_near_climber
 
     @classmethod
     def next_id(cls) -> int:
@@ -223,6 +227,8 @@ class ChalkGptConfig:
     superglue_model: str = 'outdoor'
     mask_for_matching: bool = False
     max_frames: int = None
+    hold_to_traj_association_distance_px: float = 200
+    static_video_shift_thr_px: float = 10.0
 
     def __post_init__(self):
         assert self.images_dir is not None or self.video_file is not None, "must provide video/frames path"
@@ -302,10 +308,11 @@ class ChalkGpt:
     yolo_holds: object
     vector_db: FAISSIndex
 
+    static_video: bool
     CLIMBER_OBJECT_ID = 1
     WALL_OBJECT_ID = 2
     HOLDS_OBJECT_ID = 3
-    transform_from_reference_frame: Dict[str, np.ndarray]
+    transform_from_reference_frame: Dict[int, np.ndarray]
     H_ext: int
     W_ext: int
     def   __init__(self, config: ChalkGptConfig):
@@ -361,8 +368,17 @@ class ChalkGpt:
 
             self.transform_from_reference_frame = {}
             self.estimate_relative_motion(video_segments=video_segments, frame_names=frame_names)
+            self.describe_video()
             self.match_holds()
             self.visualize(video_segments=video_segments, frame_names=frame_names)
+
+    def describe_video(self):
+        cam_shift = [np.linalg.norm(t[:2, 2]) for t in self.transform_from_reference_frame.values()]
+        static_video: bool = True
+        for shift in cam_shift:
+            if shift > self.config.static_video_shift_thr_px:
+                static_video = False
+        self.static_video = static_video
 
     def init_frames(self):
         frame_names = [
@@ -444,13 +460,17 @@ class ChalkGpt:
         #                             frame_names=frame_names)
         video_segments = {}
         for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(inference_state):
-            if self.config.max_frames is not None and out_frame_idx > self.config.max_frames:
+            if self.config.max_frames is not None and out_frame_idx >= self.config.max_frames:
                 break
-            video_segments[out_frame_idx] = {
-                out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                for i, out_obj_id in enumerate(out_obj_ids)
-            }
-
+            video_segments[out_frame_idx] = {out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy() for i, out_obj_id in enumerate(out_obj_ids)}
+            for out_obj_id, out_mask in video_segments[out_frame_idx].items():
+                out_mask = out_mask.squeeze()
+                if out_obj_id == self.CLIMBER_OBJECT_ID:
+                    bbox = get_bounding_box(mask=out_mask, pad=50)
+                    frame_data = self.frames_data[out_frame_idx]
+                    for hold in frame_data.holds:
+                        if np.linalg.norm(hold.get_center() - bbox.get_center()) < self.config.hold_to_traj_association_distance_px:
+                            hold.is_near_climber = True
         return video_segments
 
     def get_world_frame(self, frame_names) -> np.ndarray:
@@ -496,6 +516,8 @@ class ChalkGpt:
             raw_frame = np.array(frame)
             blended_frame = np.array(raw_frame)
             for hold in self.frames_data[out_frame_idx].holds:
+                if not hold.is_near_climber:
+                    continue
                 blended_frame = hold.draw_on_image(blended_frame, label=f'{hold.id}')
 
             for out_obj_id, out_mask in video_segments[out_frame_idx].items():
@@ -514,7 +536,7 @@ class ChalkGpt:
                     if self.W_ext != 0:
                         end_col = -self.W_ext
                     world_frame_with_climber[self.H_ext:end_row,self.W_ext:end_col] = raw_frame
-                    T = self.transform_from_reference_frame[frame_names[out_frame_idx]]
+                    T = self.transform_from_reference_frame[out_frame_idx]
                     bbox.apply_transform(T=self.get_world_frame_placement_transform())
                     bbox.apply_transform(T=T)
                     world_frame_final = cv2.warpAffine(world_frame_with_climber, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
@@ -571,12 +593,12 @@ class ChalkGpt:
         ref_frame_idx: int = self.get_ref_frame_idx()
         ref_img = self.get_masked_image(video_segments=video_segments, frame_names=frame_names, frame_idx=ref_frame_idx)
         ref_img_kpts: KeypointData = self.detector.detectAndCompute(ref_img, self.config.device)
-        for i in tqdm.tqdm(range(0, len(frame_names)-1), total=len(frame_names)):
+        for i in tqdm.tqdm(range(len(frame_names)), total=len(frame_names)):
             tqdm.tqdm.write(f'Processing frame {i}')  # Display the current frame index
             img_1 = self.get_masked_image(video_segments=video_segments, frame_names=frame_names, frame_idx=i)
             img_1_kp_data: KeypointData = self.detector.detectAndCompute(img_1, self.config.device)
             kp_matching_res: KeypointMatchingResults = self.matcher.match(img_1_kp_data, ref_img_kpts)
-            self.transform_from_reference_frame[frame_names[i]] = estimate_relative_pose(kp_matching_res)
+            self.transform_from_reference_frame[i] = estimate_relative_pose(kp_matching_res)
             # cv2.imshow("match",cv2.drawMatches(img_0, matches.img_0_kpts, img_1, matches.img_1_kpts, matches.matches, None))
             # cv2.waitKey(100)
 
@@ -585,19 +607,36 @@ class ChalkGpt:
         ref_frame: FrameData = self.frames_data[self.get_ref_frame_idx()]
         ref_holds: List[HoldBBox] = ref_frame.holds
         embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in ref_holds])
+
+        ref_holds_centers: np.ndarray = np.array([hold.get_center() for hold in ref_holds]).T
+        if not self.static_video:
+            ref_holds_centers_H: np.ndarray = np.vstack((ref_holds_centers, np.ones((1, len(ref_holds)))))
+
         for id, hold in enumerate(ref_holds):
             hold.id = id
 
-        # ids = [hold.id for hold in ref_frame.holds]
         self.vector_db.add_vectors(vectors=embeddings)
-        # distances, indices, metadata = self.vector_db.search(embeddings, k=1)
+
         for frame_id, frame_data in self.frames_data.items():
+            # transform holds from reference to current frame
+            if not self.static_video:
+                T_ref_to_frame: np.ndarray = self.transform_from_reference_frame.get(frame_id)
+                T_ref_to_frame_H: np.ndarray = np.vstack((T_ref_to_frame, np.array([.0, .0, 1.0])))
+                ref_holds_in_frame: np.ndarray = (T_ref_to_frame_H @ ref_holds_centers_H)[:2]
+            else:
+                ref_holds_in_frame = ref_holds_centers
+
             # get holds embeddings
             target_holds: List[HoldBBox] = frame_data.holds
             embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in target_holds])
-            distances, indices, metadata = self.vector_db.search(embeddings, k=1)
-            for targ_hold_idx, ref_hold_idx in enumerate(indices.squeeze()):
-                target_holds[targ_hold_idx].id = ref_holds[ref_hold_idx].id
+            k_neighbors: int = 5
+            distances, indices, metadata = self.vector_db.search(embeddings, k=k_neighbors)
+            for targ_hold_idx, matched_ref_indices in enumerate(indices.squeeze()):
+                targ_hold: HoldBBox = target_holds[targ_hold_idx]
+                candidates_positions = ref_holds_in_frame[:, matched_ref_indices]
+                candidate_distances = candidates_positions.T - targ_hold.get_center()
+                matched_ref = np.argmin(np.linalg.norm(candidate_distances, axis=1))
+                targ_hold.id = ref_holds[matched_ref_indices[matched_ref]].id
 
 
 
