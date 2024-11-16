@@ -15,6 +15,7 @@ import ultralytics.engine.results
 from img2vec_pytorch import Img2Vec
 from matplotlib import pyplot as plt
 from PIL import Image
+from scipy.spatial import cKDTree
 from super_gradients.training.utils.predict import ImagePoseEstimationPrediction
 from ultralytics import YOLO
 from ultralytics.engine.results import Results, Boxes
@@ -140,7 +141,7 @@ class BoundingBox:
         return img_with_box
 
     def get_center(self) -> np.ndarray:
-        return 1/2*(np.array(self.top_left)+np.array(self.bottom_right[0]))
+        return 1/2*(np.array(self.top_left)+np.array(self.bottom_right))
 
 class HoldBBox(BoundingBox):
     id: int
@@ -505,6 +506,7 @@ class ChalkGpt:
             box: HoldBBox = HoldBBox.from_ultralytics_bbox(ultralytics_bbox=box)
             out.append(box)
         embeddings = self.img2vec.get_vec([Image.fromarray(b.get_image_crop(im_bgr)) for b in out], tensor=True)
+        embeddings /= torch.norm(embeddings, p=2, dim=1, keepdim=True)
         for embedding, box in zip(embeddings, out):
             box.embedding = embedding.squeeze()
         return out
@@ -606,7 +608,7 @@ class ChalkGpt:
         # add reference holds to DB
         ref_frame: FrameData = self.frames_data[self.get_ref_frame_idx()]
         ref_holds: List[HoldBBox] = ref_frame.holds
-        embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in ref_holds])
+        ref_embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in ref_holds])
 
         ref_holds_centers: np.ndarray = np.array([hold.get_center() for hold in ref_holds]).T
         if not self.static_video:
@@ -615,17 +617,29 @@ class ChalkGpt:
         for id, hold in enumerate(ref_holds):
             hold.id = id
 
-        self.vector_db.add_vectors(vectors=embeddings)
+        self.vector_db.add_vectors(vectors=ref_embeddings)
 
         for frame_id, frame_data in self.frames_data.items():
+            matched_holds = []
             # transform holds from reference to current frame
             if not self.static_video:
                 T_ref_to_frame: np.ndarray = self.transform_from_reference_frame.get(frame_id)
                 T_ref_to_frame_H: np.ndarray = np.vstack((T_ref_to_frame, np.array([.0, .0, 1.0])))
-                ref_holds_in_frame: np.ndarray = (T_ref_to_frame_H @ ref_holds_centers_H)[:2]
+                ref_holds_in_frame: np.ndarray = (np.linalg.inv(T_ref_to_frame_H) @ ref_holds_centers_H)[:2]
             else:
                 ref_holds_in_frame = ref_holds_centers
 
+            # targ_positions = np.array([h.get_center() for h in frame_data.holds])
+            # kdtree = cKDTree(targ_positions)
+            # # Find the 2 nearest neighbors for each feature in the second set
+            # distances, indices = kdtree.query(ref_holds_in_frame.T, k=3)
+            # for ref_hold_idx, matched_targ_indices in enumerate(indices):
+            #     for matched_targ_idx in matched_targ_indices:
+            #         if matched_targ_idx not in matched_holds:
+            #             matched_holds.append(matched_targ_idx)
+            #             frame_data.holds[matched_targ_idx].id = ref_holds[ref_hold_idx].id
+
+            # a=3
             # get holds embeddings
             target_holds: List[HoldBBox] = frame_data.holds
             embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in target_holds])
@@ -636,7 +650,11 @@ class ChalkGpt:
                 candidates_positions = ref_holds_in_frame[:, matched_ref_indices]
                 candidate_distances = candidates_positions.T - targ_hold.get_center()
                 matched_ref = np.argmin(np.linalg.norm(candidate_distances, axis=1))
-                targ_hold.id = ref_holds[matched_ref_indices[matched_ref]].id
+                if matched_ref_indices[matched_ref] not in matched_holds:
+                    targ_hold.id = ref_holds[matched_ref_indices[matched_ref]].id
+                    matched_holds.append(matched_ref_indices[matched_ref])
+                else:
+                    pass
 
 
 
