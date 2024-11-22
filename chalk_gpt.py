@@ -1,3 +1,4 @@
+
 import dataclasses
 import enum
 import os
@@ -5,7 +6,8 @@ import pickle
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
-
+import random
+import string
 import cv2
 import numpy as np
 import super_gradients
@@ -165,10 +167,14 @@ class HoldBBox(BoundingBox):
         cls.global_uid += 1
         return cls.global_uid
 
+    def draw_on_image(self,**kwargs):
+        label: str = '' if self.id is None else f"{self.id}"
+        BoundingBox.draw_on_image(label=label, **kwargs)
+
     @classmethod
-    def from_ultralytics_bbox(cls, ultralytics_bbox) -> 'HoldBBox':
+    def from_ultralytics_bbox(cls, ultralytics_bbox, id: int = None) -> 'HoldBBox':
         xyxy: Tuple[float] = tuple([int(i) for i in ultralytics_bbox.xyxy.cpu().numpy().squeeze()])
-        return HoldBBox(top_left=xyxy[:2],bottom_right=xyxy[2:])
+        return HoldBBox(top_left=xyxy[:2],bottom_right=xyxy[2:], id=id)
 
 def show_mask(mask, ax, obj_id=None, random_color=False):
     if random_color:
@@ -299,6 +305,26 @@ class FrameData:
     def get_image(self) -> np.ndarray:
         return cv2.imread(self.im_path)
 
+    def get_holds_near_climber(self):
+        return [h for h in self.holds if h.is_near_climber]
+
+    def draw_holds_on_image(self, holds: List[HoldBBox] = None) -> np.ndarray:
+        if holds is None:
+            holds = self.holds
+        out: np.ndarray = self.get_image()
+        for h in holds:
+            label = None if h.id is None else f"{h.id}"
+            out = h.draw_on_image(im=out, label=label)
+        return out
+
+
+
+class RandomLabelsGenerator:
+    @staticmethod
+    def generate():
+        """Generate a random string of 6 English letters."""
+        return ''.join(random.choices(string.ascii_letters, k=6))
+
 class ChalkGpt:
     frames_data: Dict[int, FrameData]
 
@@ -308,7 +334,7 @@ class ChalkGpt:
     yolo_pose: object
     yolo_holds: object
     vector_db: FAISSIndex
-
+    random_labels_generator: RandomLabelsGenerator
     static_video: bool
     CLIMBER_OBJECT_ID = 1
     WALL_OBJECT_ID = 2
@@ -336,6 +362,8 @@ class ChalkGpt:
                             'match_threshold':self.config.matcher_threshold}
         self.detector = SuperPoint(config=superpoint_config).to(self.config.device).eval()
         self.matcher = SuperGlue(superglue_config).to(self.config.device).eval()
+
+        self.random_labels_generator = RandomLabelsGenerator()
 
         if config.images_dir is None:
             output_dir: str = Path(config.video_file).stem
@@ -503,7 +531,8 @@ class ChalkGpt:
         yolo_res: Results = self.yolo_holds(im_path)[0]
         out: List[HoldBBox] = []
         for box in yolo_res.boxes:
-            box: HoldBBox = HoldBBox.from_ultralytics_bbox(ultralytics_bbox=box)
+            random_label = self.random_labels_generator.generate()
+            box: HoldBBox = HoldBBox.from_ultralytics_bbox(ultralytics_bbox=box, id=random_label)
             out.append(box)
         embeddings = self.img2vec.get_vec([Image.fromarray(b.get_image_crop(im_bgr)) for b in out], tensor=True)
         embeddings /= torch.norm(embeddings, p=2, dim=1, keepdim=True)
@@ -607,8 +636,8 @@ class ChalkGpt:
     def match_holds(self):
         # add reference holds to DB
         ref_frame: FrameData = self.frames_data[self.get_ref_frame_idx()]
-        ref_holds: List[HoldBBox] = ref_frame.holds
-        ref_embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in ref_holds])
+        ref_holds: List[HoldBBox] = ref_frame.get_holds_near_climber()
+        ref_embeddings: np.ndarray = np.array([h.embedding.cpu().numpy() for h in ref_holds])
 
         ref_holds_centers: np.ndarray = np.array([hold.get_center() for hold in ref_holds]).T
         if not self.static_video:
@@ -620,7 +649,6 @@ class ChalkGpt:
         self.vector_db.add_vectors(vectors=ref_embeddings)
 
         for frame_id, frame_data in self.frames_data.items():
-            matched_holds = []
             # transform holds from reference to current frame
             if not self.static_video:
                 T_ref_to_frame: np.ndarray = self.transform_from_reference_frame.get(frame_id)
@@ -630,6 +658,13 @@ class ChalkGpt:
                 ref_holds_in_frame = ref_holds_centers
 
             # targ_positions = np.array([h.get_center() for h in frame_data.holds])
+            # targ_holds =
+            # for t_pos in targ_positions:
+            #     for ref_hold in ref_holds:
+            #         if ref_hold.is_near_climber:
+
+            # targ_embeddings = np.array([h.embedding for h in frame_data.holds])
+
             # kdtree = cKDTree(targ_positions)
             # # Find the 2 nearest neighbors for each feature in the second set
             # distances, indices = kdtree.query(ref_holds_in_frame.T, k=3)
@@ -641,7 +676,8 @@ class ChalkGpt:
 
             # a=3
             # get holds embeddings
-            target_holds: List[HoldBBox] = frame_data.holds
+            matched_holds = []
+            target_holds: List[HoldBBox] = frame_data.get_holds_near_climber()
             embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in target_holds])
             k_neighbors: int = 5
             distances, indices, metadata = self.vector_db.search(embeddings, k=k_neighbors)
@@ -650,18 +686,18 @@ class ChalkGpt:
                 candidates_positions = ref_holds_in_frame[:, matched_ref_indices]
                 candidate_distances = candidates_positions.T - targ_hold.get_center()
                 matched_ref = np.argmin(np.linalg.norm(candidate_distances, axis=1))
-                if matched_ref_indices[matched_ref] not in matched_holds:
-                    targ_hold.id = ref_holds[matched_ref_indices[matched_ref]].id
-                    matched_holds.append(matched_ref_indices[matched_ref])
-                else:
-                    pass
+                # if matched_ref_indices[matched_ref] not in matched_holds:
+                targ_hold.id = ref_holds[matched_ref_indices[matched_ref]].id
+                matched_holds.append(matched_ref_indices[matched_ref])
+                # else:
+                #     pass
 
 
 
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
-                                            try_to_load_from_disk=True,
+                                            try_to_load_from_disk=False,
                                             images_dir='downloaded_frames_tag',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
@@ -669,6 +705,6 @@ if __name__ == "__main__":
                                             detector_threshold=.1,
                                             superglue_model='outdoor',
                                             mask_for_matching=False,
-                                            max_frames=None)
+                                            max_frames=100)
     chalk_gpt: ChalkGpt = ChalkGpt(config)
     chalk_gpt.main()
