@@ -168,8 +168,9 @@ class HoldBBox(BoundingBox):
         return cls.global_uid
 
     def draw_on_image(self,**kwargs):
-        label: str = '' if self.id is None else f"{self.id}"
-        BoundingBox.draw_on_image(label=label, **kwargs)
+        if kwargs.get('label') is None:
+            kwargs['label'] = '' if self.id is None else f"{self.id}"
+        return BoundingBox.draw_on_image(self, **kwargs)
 
     @classmethod
     def from_ultralytics_bbox(cls, ultralytics_bbox, id: int = None) -> 'HoldBBox':
@@ -313,8 +314,7 @@ class FrameData:
             holds = self.holds
         out: np.ndarray = self.get_image()
         for h in holds:
-            label = None if h.id is None else f"{h.id}"
-            out = h.draw_on_image(im=out, label=label)
+            out = h.draw_on_image(im=out)
         return out
 
 
@@ -477,7 +477,7 @@ class ChalkGpt:
 
     def find_holds_all_frames(self, frame_names):
         for frame_id, frame_data in tqdm.tqdm(self.frames_data.items(), total=len(self.frames_data)):
-            frame_data.holds = self.detect_holds(im_path=frame_data.im_path)
+            frame_data.holds = self.detect_holds(frame_id=frame_id,im_path=frame_data.im_path)
 
     def process_frames(self, frame_names):
         inference_state = self.predictor.init_state(video_path=self.config.images_dir, offload_video_to_cpu=True,
@@ -497,9 +497,17 @@ class ChalkGpt:
                 if out_obj_id == self.CLIMBER_OBJECT_ID:
                     bbox = get_bounding_box(mask=out_mask, pad=50)
                     frame_data = self.frames_data[out_frame_idx]
+                    holds_near_climber = []
                     for hold in frame_data.holds:
                         if np.linalg.norm(hold.get_center() - bbox.get_center()) < self.config.hold_to_traj_association_distance_px:
                             hold.is_near_climber = True
+                            holds_near_climber.append(hold)
+
+                    # bottom-up holds indexing
+                    holds_near_climber = sorted(holds_near_climber, key=lambda x: x.get_center()[1], reverse=True)
+                    for hold_id, h in enumerate(holds_near_climber):
+                        h.id = f'{out_frame_idx}_{hold_id}'
+
         return video_segments
 
     def get_world_frame(self, frame_names) -> np.ndarray:
@@ -526,14 +534,15 @@ class ChalkGpt:
         out[1, 2] = self.H_ext
         return out
 
-    def detect_holds(self, im_path: str):
+    def detect_holds(self, frame_id:int, im_path: str):
         im_bgr: np.ndarray = cv2.cvtColor(cv2.imread(im_path), cv2.COLOR_BGR2RGB)
         yolo_res: Results = self.yolo_holds(im_path)[0]
         out: List[HoldBBox] = []
+        detected_holds = yolo_res.boxes
         for box in yolo_res.boxes:
-            random_label = self.random_labels_generator.generate()
-            box: HoldBBox = HoldBBox.from_ultralytics_bbox(ultralytics_bbox=box, id=random_label)
+            box: HoldBBox = HoldBBox.from_ultralytics_bbox(ultralytics_bbox=box)
             out.append(box)
+
         embeddings = self.img2vec.get_vec([Image.fromarray(b.get_image_crop(im_bgr)) for b in out], tensor=True)
         embeddings /= torch.norm(embeddings, p=2, dim=1, keepdim=True)
         for embedding, box in zip(embeddings, out):
@@ -549,7 +558,7 @@ class ChalkGpt:
             for hold in self.frames_data[out_frame_idx].holds:
                 if not hold.is_near_climber:
                     continue
-                blended_frame = hold.draw_on_image(blended_frame, label=f'{hold.id}')
+                blended_frame = hold.draw_on_image(im=blended_frame, label=f'{hold.id}')
 
             for out_obj_id, out_mask in video_segments[out_frame_idx].items():
                 out_mask = out_mask.squeeze()
@@ -635,20 +644,19 @@ class ChalkGpt:
 
     def match_holds(self):
         # add reference holds to DB
-        ref_frame: FrameData = self.frames_data[self.get_ref_frame_idx()]
+        ref_frame: FrameData = self.frames_data[0]
         ref_holds: List[HoldBBox] = ref_frame.get_holds_near_climber()
         ref_embeddings: np.ndarray = np.array([h.embedding.cpu().numpy() for h in ref_holds])
-
         ref_holds_centers: np.ndarray = np.array([hold.get_center() for hold in ref_holds]).T
         if not self.static_video:
             ref_holds_centers_H: np.ndarray = np.vstack((ref_holds_centers, np.ones((1, len(ref_holds)))))
 
-        for id, hold in enumerate(ref_holds):
-            hold.id = id
-
         self.vector_db.add_vectors(vectors=ref_embeddings)
 
         for frame_id, frame_data in self.frames_data.items():
+            if frame_id == ref_frame.id:
+                continue
+
             # transform holds from reference to current frame
             if not self.static_video:
                 T_ref_to_frame: np.ndarray = self.transform_from_reference_frame.get(frame_id)
@@ -686,18 +694,18 @@ class ChalkGpt:
                 candidates_positions = ref_holds_in_frame[:, matched_ref_indices]
                 candidate_distances = candidates_positions.T - targ_hold.get_center()
                 matched_ref = np.argmin(np.linalg.norm(candidate_distances, axis=1))
-                # if matched_ref_indices[matched_ref] not in matched_holds:
-                targ_hold.id = ref_holds[matched_ref_indices[matched_ref]].id
-                matched_holds.append(matched_ref_indices[matched_ref])
-                # else:
-                #     pass
+                if matched_ref_indices[matched_ref] not in matched_holds:
+                    targ_hold.id = ref_holds[matched_ref_indices[matched_ref]].id
+                    matched_holds.append(matched_ref_indices[matched_ref])
+                else:
+                    pass
 
 
 
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
-                                            try_to_load_from_disk=False,
+                                            try_to_load_from_disk=True,
                                             images_dir='downloaded_frames_tag',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
