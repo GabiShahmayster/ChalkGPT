@@ -395,9 +395,9 @@ class ChalkGpt:
                     with open(output_path, 'wb') as f:
                         pickle.dump(save_data, f)
 
-            self.transform_from_reference_frame = {}
             self.estimate_relative_motion(video_segments=video_segments, frame_names=frame_names)
             self.describe_video()
+            self.label_all_holds()
             self.match_holds()
             self.visualize(video_segments=video_segments, frame_names=frame_names)
 
@@ -503,10 +503,11 @@ class ChalkGpt:
                             hold.is_near_climber = True
                             holds_near_climber.append(hold)
 
-                    # bottom-up holds indexing
-                    holds_near_climber = sorted(holds_near_climber, key=lambda x: x.get_center()[1], reverse=True)
-                    for hold_id, h in enumerate(holds_near_climber):
-                        h.id = f'{out_frame_idx}_{hold_id}'
+                    if out_frame_idx == 0:
+                        # bottom-up holds indexing
+                        holds_near_climber = sorted(holds_near_climber, key=lambda x: x.get_center()[1], reverse=True)
+                        for hold_id, h in enumerate(holds_near_climber):
+                            h.id = f'{out_frame_idx}_{hold_id}'
 
         return video_segments
 
@@ -518,7 +519,7 @@ class ChalkGpt:
         delta_y_per_frame = np.array([t[1, 2] for t in self.transform_from_reference_frame.values()])
         max_delta_x = delta_x_per_frame[np.argmax(np.abs(delta_x_per_frame))]
         max_delta_y = delta_y_per_frame[np.argmax(np.abs(delta_y_per_frame))]
-        frame: np.ndarray = cv2.imread(os.path.join(self.config.images_dir, frame_names[0]))
+        frame: np.ndarray = cv2.imread(os.path.join(self.config.images_dir, frame_names[self.get_world_frame_idx()]))
         H, W = frame.shape[:2]
         self.H_ext = int(abs(max_delta_y))
         self.W_ext = int(abs(max_delta_x))
@@ -576,7 +577,7 @@ class ChalkGpt:
                     if self.W_ext != 0:
                         end_col = -self.W_ext
                     world_frame_with_climber[self.H_ext:end_row,self.W_ext:end_col] = raw_frame
-                    T = self.transform_from_reference_frame[out_frame_idx]
+                    T = self.transform_from_reference_frame[out_frame_idx][:2]
                     bbox.apply_transform(T=self.get_world_frame_placement_transform())
                     bbox.apply_transform(T=T)
                     world_frame_final = cv2.warpAffine(world_frame_with_climber, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
@@ -626,79 +627,82 @@ class ChalkGpt:
         else:
             return im
 
-    def get_ref_frame_idx(self):
-        return len(self.frames_data) // 2
+    def get_world_frame_idx(self):
+        return 0
 
     def estimate_relative_motion(self, video_segments, frame_names):
-        ref_frame_idx: int = self.get_ref_frame_idx()
-        ref_img = self.get_masked_image(video_segments=video_segments, frame_names=frame_names, frame_idx=ref_frame_idx)
-        ref_img_kpts: KeypointData = self.detector.detectAndCompute(ref_img, self.config.device)
-        for i in tqdm.tqdm(range(len(frame_names)), total=len(frame_names)):
+        self.relative_motion = {}
+        curr_kpts: Optional[KeypointData] = None
+        for i in tqdm.tqdm(range(len(frame_names)-1), total=len(frame_names)):
             tqdm.tqdm.write(f'Processing frame {i}')  # Display the current frame index
-            img_1 = self.get_masked_image(video_segments=video_segments, frame_names=frame_names, frame_idx=i)
-            img_1_kp_data: KeypointData = self.detector.detectAndCompute(img_1, self.config.device)
-            kp_matching_res: KeypointMatchingResults = self.matcher.match(img_1_kp_data, ref_img_kpts)
-            self.transform_from_reference_frame[i] = estimate_relative_pose(kp_matching_res)
-            # cv2.imshow("match",cv2.drawMatches(img_0, matches.img_0_kpts, img_1, matches.img_1_kpts, matches.matches, None))
-            # cv2.waitKey(100)
+            if curr_kpts is None:
+                curr_img = self.get_masked_image(video_segments=video_segments, frame_names=frame_names, frame_idx=i)
+                curr_kpts: KeypointData = self.detector.detectAndCompute(curr_img, self.config.device)
+            next_img = self.get_masked_image(video_segments=video_segments, frame_names=frame_names, frame_idx=i+1)
+            next_kpts: KeypointData = self.detector.detectAndCompute(next_img, self.config.device)
+            kp_matching_res: KeypointMatchingResults = self.matcher.match(next_kpts, curr_kpts)
+            self.relative_motion[(i, i+1)] = np.vstack((estimate_relative_pose(kp_matching_res), np.array([.0, .0, 1.0])))
+            curr_kpts = next_kpts
+
+        self.transform_from_reference_frame = {}
+        accumulated_transform = np.eye(3)
+        self.transform_from_reference_frame[0] = accumulated_transform
+        for i in range(1, len(frame_names)-1):
+            accumulated_transform = accumulated_transform @ self.relative_motion[(i-1, i)]
+            self.transform_from_reference_frame[i] = accumulated_transform[:2]
 
     def match_holds(self):
         # add reference holds to DB
-        ref_frame: FrameData = self.frames_data[0]
-        ref_holds: List[HoldBBox] = ref_frame.get_holds_near_climber()
+        ref_frame_id: int = 0
+        ref_frame_data: FrameData = self.frames_data[ref_frame_id]
+        ref_holds: List[HoldBBox] = ref_frame_data.get_holds_near_climber()
         ref_embeddings: np.ndarray = np.array([h.embedding.cpu().numpy() for h in ref_holds])
-        ref_holds_centers: np.ndarray = np.array([hold.get_center() for hold in ref_holds]).T
+        ref_centers: np.ndarray = np.array([hold.get_center() for hold in ref_holds]).T
         if not self.static_video:
-            ref_holds_centers_H: np.ndarray = np.vstack((ref_holds_centers, np.ones((1, len(ref_holds)))))
+            ref_centers_H: np.ndarray = np.vstack((ref_centers, np.ones((1, len(ref_holds)))))
 
         self.vector_db.add_vectors(vectors=ref_embeddings)
 
-        for frame_id, frame_data in self.frames_data.items():
-            if frame_id == ref_frame.id:
+        for curr_frame_id, frame_data in self.frames_data.items():
+            if curr_frame_id == ref_frame_id:
                 continue
 
             # transform holds from reference to current frame
             if not self.static_video:
-                T_ref_to_frame: np.ndarray = self.transform_from_reference_frame.get(frame_id)
-                T_ref_to_frame_H: np.ndarray = np.vstack((T_ref_to_frame, np.array([.0, .0, 1.0])))
-                ref_holds_in_frame: np.ndarray = (np.linalg.inv(T_ref_to_frame_H) @ ref_holds_centers_H)[:2]
+                T_ref_to_curr: np.ndarray = self.relative_motion[(ref_frame_id, curr_frame_id)]
+                ref_holds_in_frame: np.ndarray = (np.linalg.inv(T_ref_to_curr) @ ref_centers_H)[:2]
             else:
-                ref_holds_in_frame = ref_holds_centers
+                ref_holds_in_frame = ref_centers
 
-            # targ_positions = np.array([h.get_center() for h in frame_data.holds])
-            # targ_holds =
-            # for t_pos in targ_positions:
-            #     for ref_hold in ref_holds:
-            #         if ref_hold.is_near_climber:
+            targ_positions = np.array([h.get_center() for h in frame_data.holds])
+            kdtree = cKDTree(targ_positions)
+            # Find the 2 nearest neighbors for each feature in the second set
+            distances, indices = kdtree.query(ref_holds_in_frame.T, k=3)
+            for ref_hold_idx, (dist, matched_targ_indices) in enumerate(zip(distances,indices)):
+                if dist[0] < 10.0:
+                    frame_data.holds[matched_targ_indices[0]].id = ref_holds[ref_hold_idx].id
 
-            # targ_embeddings = np.array([h.embedding for h in frame_data.holds])
-
-            # kdtree = cKDTree(targ_positions)
-            # # Find the 2 nearest neighbors for each feature in the second set
-            # distances, indices = kdtree.query(ref_holds_in_frame.T, k=3)
-            # for ref_hold_idx, matched_targ_indices in enumerate(indices):
-            #     for matched_targ_idx in matched_targ_indices:
-            #         if matched_targ_idx not in matched_holds:
-            #             matched_holds.append(matched_targ_idx)
-            #             frame_data.holds[matched_targ_idx].id = ref_holds[ref_hold_idx].id
+            ref_frame_id = curr_frame_id
+            ref_centers_H: np.ndarray = np.hstack((targ_positions, np.ones((len(frame_data.holds), 1)))).T
+            ref_holds = frame_data.holds
 
             # a=3
             # get holds embeddings
-            matched_holds = []
-            target_holds: List[HoldBBox] = frame_data.get_holds_near_climber()
-            embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in target_holds])
-            k_neighbors: int = 5
-            distances, indices, metadata = self.vector_db.search(embeddings, k=k_neighbors)
-            for targ_hold_idx, matched_ref_indices in enumerate(indices.squeeze()):
-                targ_hold: HoldBBox = target_holds[targ_hold_idx]
-                candidates_positions = ref_holds_in_frame[:, matched_ref_indices]
-                candidate_distances = candidates_positions.T - targ_hold.get_center()
-                matched_ref = np.argmin(np.linalg.norm(candidate_distances, axis=1))
-                if matched_ref_indices[matched_ref] not in matched_holds:
-                    targ_hold.id = ref_holds[matched_ref_indices[matched_ref]].id
-                    matched_holds.append(matched_ref_indices[matched_ref])
-                else:
-                    pass
+            # matched_holds = []
+            # target_holds: List[HoldBBox] = frame_data.get_holds_near_climber()
+            # embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in target_holds])
+            # k_neighbors: int = 5
+            # distances, indices, metadata = self.vector_db.search(embeddings, k=k_neighbors)
+            # for targ_hold_idx, matched_ref_indices in enumerate(indices.squeeze()):
+            #     targ_hold: HoldBBox = target_holds[targ_hold_idx]
+            #     candidates_positions = ref_holds_in_frame[:, matched_ref_indices]
+            #     candidate_distances = candidates_positions.T - targ_hold.get_center()
+            #     matched_ref = np.argmin(np.linalg.norm(candidate_distances, axis=1))
+            #     if matched_ref_indices[matched_ref] not in matched_holds:
+            #         targ_hold.id = curr_holds[matched_ref_indices[matched_ref]].id
+            #         matched_holds.append(matched_ref_indices[matched_ref])
+            #     else:
+            #         pass
 
 
 
