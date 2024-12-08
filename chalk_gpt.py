@@ -5,7 +5,7 @@ import os
 import pickle
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import random
 import string
 import cv2
@@ -14,11 +14,15 @@ import super_gradients
 import torch
 import tqdm
 import ultralytics.engine.results
+from comet_ml.logging_extensions.rich_decoration.environment import width
 from img2vec_pytorch import Img2Vec
 from matplotlib import pyplot as plt
 from PIL import Image
 from scipy.spatial import cKDTree
+from sklearn.cluster import DBSCAN
 from super_gradients.training.utils.predict import ImagePoseEstimationPrediction
+from sympy.integrals.risch import residue_reduce_to_basic
+from torchvision.utils import draw_bounding_boxes
 from ultralytics import YOLO
 from ultralytics.engine.results import Results, Boxes
 
@@ -68,7 +72,7 @@ class BoundingBox:
 
     def draw_on_image(self,
             im: np.ndarray,
-            color: Tuple[int, int, int] = (0, 255, 0),  # Default green color
+            color: Tuple[int, int, int] = (0, 0, 0),  # Default green color
             thickness: int = 2,
             label: str = None,
             font_scale: float = 0.5,
@@ -150,9 +154,12 @@ class HoldBBox(BoundingBox):
     embedding: torch.Tensor
     global_uid: int = -1
     is_near_climber: bool = False
+    is_labeled: bool = False
+    UNABELED_ID:int = -1
 
     def __init__(self, top_left: tuple, bottom_right: tuple, id: int = None,
-                 embedding: torch.Tensor = None, width_px: int = None, height_px: int = None, is_near_climber: bool = False):
+                 embedding: torch.Tensor = None, width_px: int = None, height_px: int = None,
+                 is_near_climber: bool = False, is_labeled: bool = False):
         BoundingBox.__init__(self,
                              top_left=top_left,
                              bottom_right=bottom_right,
@@ -161,9 +168,19 @@ class HoldBBox(BoundingBox):
         self.id = id
         self.embedding = embedding
         self.is_near_climber = is_near_climber
+        self.is_labeled = is_labeled
+
+    def __copy__(self):
+        return HoldBBox(top_left=self.top_left,
+                        bottom_right=self.bottom_right,
+                        id=self.id,
+                        embedding=self.embedding,
+                        width_px=self.width_px,
+                        height_px=self.height_px,
+                        is_near_climber=self.is_near_climber)
 
     @classmethod
-    def next_id(cls) -> int:
+    def next_id(cls) -> str:
         cls.global_uid += 1
         return cls.global_uid
 
@@ -176,6 +193,20 @@ class HoldBBox(BoundingBox):
     def from_ultralytics_bbox(cls, ultralytics_bbox, id: int = None) -> 'HoldBBox':
         xyxy: Tuple[float] = tuple([int(i) for i in ultralytics_bbox.xyxy.cpu().numpy().squeeze()])
         return HoldBBox(top_left=xyxy[:2],bottom_right=xyxy[2:], id=id)
+
+def get_holds_centers(holds: List[HoldBBox], return_homogeneous: bool = False) -> np.ndarray:
+    if return_homogeneous:
+        out: np.ndarray = np.ones((3, len(holds)))
+        out[:2] = np.array([h.get_center() for h in holds]).T
+        return out
+    else:
+        return np.array([h.get_center() for h in holds]).T
+
+def draw_holds_on_image(im: np.ndarray, holds: List[HoldBBox] = None):
+    out = np.array(im)
+    for h in holds:
+        out = h.draw_on_image(im=out)
+    return out
 
 def show_mask(mask, ax, obj_id=None, random_color=False):
     if random_color:
@@ -235,7 +266,7 @@ class ChalkGptConfig:
     superglue_model: str = 'outdoor'
     mask_for_matching: bool = False
     max_frames: int = None
-    hold_to_traj_association_distance_px: float = 200
+    hold_to_traj_association_distance_px: float = 100
     static_video_shift_thr_px: float = 10.0
 
     def __post_init__(self):
@@ -325,6 +356,34 @@ class RandomLabelsGenerator:
         """Generate a random string of 6 English letters."""
         return ''.join(random.choices(string.ascii_letters, k=6))
 
+
+def cluster_coordinates(coordinates, eps=0.5, min_samples=5):
+    """
+    Cluster 2D coordinates using DBSCAN algorithm.
+
+    Parameters:
+    coordinates: numpy array of shape (n_samples, 2)
+    eps: float, maximum distance between two samples for them to be considered neighbors
+    min_samples: int, minimum number of samples in a neighborhood for a point to be a core point
+
+    Returns:
+    labels: array of cluster labels (-1 represents noise points)
+    n_clusters: number of clusters found
+    """
+    # Ensure input is numpy array
+    coordinates = np.array(coordinates)
+
+    # Perform DBSCAN clustering
+    clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(coordinates)
+    labels = clustering.labels_
+
+    # Get number of clusters (excluding noise points)
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+
+    return labels, n_clusters
+
+
+
 class ChalkGpt:
     frames_data: Dict[int, FrameData]
 
@@ -339,9 +398,11 @@ class ChalkGpt:
     CLIMBER_OBJECT_ID = 1
     WALL_OBJECT_ID = 2
     HOLDS_OBJECT_ID = 3
-    transform_from_reference_frame: Dict[int, np.ndarray]
+    transform_to_world: Dict[int, np.ndarray]
     H_ext: int
     W_ext: int
+    holds_world: List[HoldBBox]
+
     def   __init__(self, config: ChalkGptConfig):
         self.config = config
 
@@ -364,7 +425,7 @@ class ChalkGpt:
         self.matcher = SuperGlue(superglue_config).to(self.config.device).eval()
 
         self.random_labels_generator = RandomLabelsGenerator()
-
+        self.holds_world = []
         if config.images_dir is None:
             output_dir: str = Path(config.video_file).stem
             if not os.path.exists(output_dir):
@@ -396,13 +457,55 @@ class ChalkGpt:
                         pickle.dump(save_data, f)
 
             self.estimate_relative_motion(video_segments=video_segments, frame_names=frame_names)
+            self.define_world_frame()
             self.describe_video()
             self.label_all_holds()
             self.match_holds()
             self.visualize(video_segments=video_segments, frame_names=frame_names)
 
+    def label_all_holds(self):
+        all_holds = []
+        label_to_id = {}
+        T_init_world = self.get_world_frame_placement_transform(return_homogeneous=True)
+        all_centers = None
+        for frame_id, frame_data in self.frames_data.items():
+            temp_holds = [h for h in frame_data.holds if h.is_near_climber]
+            all_holds += temp_holds
+            centers_frame = get_holds_centers(temp_holds, return_homogeneous=True)
+            centers_world = self.transform_to_world[frame_id] @ T_init_world @ centers_frame
+            if all_centers is None:
+                all_centers = centers_world
+            else:
+                all_centers = np.hstack((all_centers, centers_world))
+        labels, n_clusters = cluster_coordinates(all_centers.T, eps=10.0, min_samples=2)
+        for lbl in set(labels):
+            if lbl==-1:
+                continue
+            center = np.mean(all_centers[:2, labels==lbl], axis=1)
+            for idx, c_id in enumerate(labels):
+                if c_id == lbl and label_to_id.get(lbl) is None:
+                    label_to_id[lbl] = all_holds[idx].id
+                    continue
+            self.holds_world.append(HoldBBox(top_left=center-np.array([10,10]), bottom_right=center+np.array([10,10]), id=label_to_id[lbl]))
+
+        for hold, label in zip(all_holds, labels):
+            if label == -1:
+                continue
+            hold.id = label_to_id[label]
+            hold.is_labeled = True
+
+        for frame_data in self.frames_data.values():
+            holds_to_keep = []
+            for hold in frame_data.holds:
+                if hold.is_labeled:
+                    holds_to_keep.append(hold)
+
+
+
+
+
     def describe_video(self):
-        cam_shift = [np.linalg.norm(t[:2, 2]) for t in self.transform_from_reference_frame.values()]
+        cam_shift = [np.linalg.norm(t[:2, 2]) for t in self.transform_to_world.values()]
         static_video: bool = True
         for shift in cam_shift:
             if shift > self.config.static_video_shift_thr_px:
@@ -503,7 +606,7 @@ class ChalkGpt:
                             hold.is_near_climber = True
                             holds_near_climber.append(hold)
 
-                    if out_frame_idx == 0:
+                    if False and out_frame_idx == 0:
                         # bottom-up holds indexing
                         holds_near_climber = sorted(holds_near_climber, key=lambda x: x.get_center()[1], reverse=True)
                         for hold_id, h in enumerate(holds_near_climber):
@@ -511,29 +614,35 @@ class ChalkGpt:
 
         return video_segments
 
+    def define_world_frame(self):
+        delta_x_per_frame = np.array([t[0, 2] for t in self.transform_to_world.values()])
+        delta_y_per_frame = np.array([t[1, 2] for t in self.transform_to_world.values()])
+        max_delta_x = delta_x_per_frame[np.argmax(np.abs(delta_x_per_frame))]
+        max_delta_y = delta_y_per_frame[np.argmax(np.abs(delta_y_per_frame))]
+        self.H_ext = int(abs(max_delta_y))
+        self.W_ext = int(abs(max_delta_x))
+
+
     def get_world_frame(self, frame_names) -> np.ndarray:
         """
         Define extended frame to contain camera motion
         """
-        delta_x_per_frame = np.array([t[0, 2] for t in self.transform_from_reference_frame.values()])
-        delta_y_per_frame = np.array([t[1, 2] for t in self.transform_from_reference_frame.values()])
-        max_delta_x = delta_x_per_frame[np.argmax(np.abs(delta_x_per_frame))]
-        max_delta_y = delta_y_per_frame[np.argmax(np.abs(delta_y_per_frame))]
         frame: np.ndarray = cv2.imread(os.path.join(self.config.images_dir, frame_names[self.get_world_frame_idx()]))
         H, W = frame.shape[:2]
-        self.H_ext = int(abs(max_delta_y))
-        self.W_ext = int(abs(max_delta_x))
         if len(frame.shape) == 3:
             world_frame: np.ndarray = np.zeros((H + 2*self.H_ext, W + 2*self.W_ext, 3), dtype=frame.dtype)
         else:
             world_frame: np.ndarray = np.zeros((H + 2*self.H_ext, W + 2*self.W_ext), dtype=frame.dtype)
         return world_frame
 
-    def get_world_frame_placement_transform(self) -> np.ndarray:
+    def get_world_frame_placement_transform(self, return_homogeneous: bool = False) -> np.ndarray:
         out: np.ndarray = np.hstack((np.eye(2), np.zeros((2,1))))
         out[0, 2] = self.W_ext
         out[1, 2] = self.H_ext
-        return out
+        if not return_homogeneous:
+            return out
+        else:
+            return np.vstack((out, np.array([.0, .0, 1.0])))
 
     def detect_holds(self, frame_id:int, im_path: str):
         im_bgr: np.ndarray = cv2.cvtColor(cv2.imread(im_path), cv2.COLOR_BGR2RGB)
@@ -541,14 +650,16 @@ class ChalkGpt:
         out: List[HoldBBox] = []
         detected_holds = yolo_res.boxes
         for box in yolo_res.boxes:
-            box: HoldBBox = HoldBBox.from_ultralytics_bbox(ultralytics_bbox=box)
+            box: HoldBBox = HoldBBox.from_ultralytics_bbox(ultralytics_bbox=box, id=f'{frame_id}.{HoldBBox.next_id()}')
             out.append(box)
 
-        embeddings = self.img2vec.get_vec([Image.fromarray(b.get_image_crop(im_bgr)) for b in out], tensor=True)
-        embeddings /= torch.norm(embeddings, p=2, dim=1, keepdim=True)
-        for embedding, box in zip(embeddings, out):
-            box.embedding = embedding.squeeze()
         return out
+        #
+        # embeddings = self.img2vec.get_vec([Image.fromarray(b.get_image_crop(im_bgr)) for b in out], tensor=True)
+        # embeddings /= torch.norm(embeddings, p=2, dim=1, keepdim=True)
+        # for embedding, box in zip(embeddings, out):
+        #     box.embedding = embedding.squeeze()
+        # return out
 
     def visualize(self, video_segments, frame_names):
         world_frame: np.ndarray = self.get_world_frame(frame_names)
@@ -577,12 +688,13 @@ class ChalkGpt:
                     if self.W_ext != 0:
                         end_col = -self.W_ext
                     world_frame_with_climber[self.H_ext:end_row,self.W_ext:end_col] = raw_frame
-                    T = self.transform_from_reference_frame[out_frame_idx][:2]
+                    T = self.transform_to_world[out_frame_idx][:2]
                     bbox.apply_transform(T=self.get_world_frame_placement_transform())
                     bbox.apply_transform(T=T)
                     world_frame_final = cv2.warpAffine(world_frame_with_climber, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
                     climber_crop = world_frame_final[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
-                    cv2.imshow("climber crop", world_frame_final)
+                    world_frame_final = draw_holds_on_image(world_frame_final, [h for h in self.holds_world if np.linalg.norm(h.get_center()-bbox.get_center()) < self.config.hold_to_traj_association_distance_px])
+                    cv2.imshow("world frame", world_frame_final)
 
                     pose: ImagePoseEstimationPrediction = self.yolo_pose.predict(climber_crop, conf=0.3, fuse_model=False, batch_size=1)
                     pose_draw = pose.draw()
@@ -644,72 +756,68 @@ class ChalkGpt:
             self.relative_motion[(i, i+1)] = np.vstack((estimate_relative_pose(kp_matching_res), np.array([.0, .0, 1.0])))
             curr_kpts = next_kpts
 
-        self.transform_from_reference_frame = {}
+        self.transform_to_world = {}
         accumulated_transform = np.eye(3)
-        self.transform_from_reference_frame[0] = accumulated_transform
-        for i in range(1, len(frame_names)-1):
+        self.transform_to_world[0] = accumulated_transform
+        for i in range(1, len(frame_names)):
             accumulated_transform = accumulated_transform @ self.relative_motion[(i-1, i)]
-            self.transform_from_reference_frame[i] = accumulated_transform[:2]
+            self.transform_to_world[i] = accumulated_transform
 
     def match_holds(self):
-        # add reference holds to DB
-        ref_frame_id: int = 0
-        ref_frame_data: FrameData = self.frames_data[ref_frame_id]
-        ref_holds: List[HoldBBox] = ref_frame_data.get_holds_near_climber()
-        ref_embeddings: np.ndarray = np.array([h.embedding.cpu().numpy() for h in ref_holds])
-        ref_centers: np.ndarray = np.array([hold.get_center() for hold in ref_holds]).T
-        if not self.static_video:
-            ref_centers_H: np.ndarray = np.vstack((ref_centers, np.ones((1, len(ref_holds)))))
-
-        self.vector_db.add_vectors(vectors=ref_embeddings)
-
+        holds_world_positions = np.array([h.get_center() for h in self.holds_world])
+        T_init_world = self.get_world_frame_placement_transform(return_homogeneous=True)
         for curr_frame_id, frame_data in self.frames_data.items():
-            if curr_frame_id == ref_frame_id:
-                continue
+            holds_in_frame = get_holds_centers(frame_data.holds, return_homogeneous=True)
+            holds_in_frame_world = self.transform_to_world[curr_frame_id] @ T_init_world @ holds_in_frame
+            kdtree = cKDTree(holds_in_frame_world[:2].T)
+            distances, indices = kdtree.query(holds_world_positions, k=1)
+            for world_idx, hold_idx in enumerate(indices):
+                frame_data.holds[hold_idx].id = self.holds_world[world_idx].id
+                frame_data.holds[hold_idx].is_labeled = True
 
-            # transform holds from reference to current frame
-            if not self.static_video:
-                T_ref_to_curr: np.ndarray = self.relative_motion[(ref_frame_id, curr_frame_id)]
-                ref_holds_in_frame: np.ndarray = (np.linalg.inv(T_ref_to_curr) @ ref_centers_H)[:2]
-            else:
-                ref_holds_in_frame = ref_centers
-
-            targ_positions = np.array([h.get_center() for h in frame_data.holds])
-            kdtree = cKDTree(targ_positions)
-            # Find the 2 nearest neighbors for each feature in the second set
-            distances, indices = kdtree.query(ref_holds_in_frame.T, k=3)
-            for ref_hold_idx, (dist, matched_targ_indices) in enumerate(zip(distances,indices)):
-                if dist[0] < 10.0:
-                    frame_data.holds[matched_targ_indices[0]].id = ref_holds[ref_hold_idx].id
-
-            ref_frame_id = curr_frame_id
-            ref_centers_H: np.ndarray = np.hstack((targ_positions, np.ones((len(frame_data.holds), 1)))).T
-            ref_holds = frame_data.holds
-
-            # a=3
-            # get holds embeddings
-            # matched_holds = []
-            # target_holds: List[HoldBBox] = frame_data.get_holds_near_climber()
-            # embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in target_holds])
-            # k_neighbors: int = 5
-            # distances, indices, metadata = self.vector_db.search(embeddings, k=k_neighbors)
-            # for targ_hold_idx, matched_ref_indices in enumerate(indices.squeeze()):
-            #     targ_hold: HoldBBox = target_holds[targ_hold_idx]
-            #     candidates_positions = ref_holds_in_frame[:, matched_ref_indices]
-            #     candidate_distances = candidates_positions.T - targ_hold.get_center()
-            #     matched_ref = np.argmin(np.linalg.norm(candidate_distances, axis=1))
-            #     if matched_ref_indices[matched_ref] not in matched_holds:
-            #         targ_hold.id = curr_holds[matched_ref_indices[matched_ref]].id
-            #         matched_holds.append(matched_ref_indices[matched_ref])
-            #     else:
-            #         pass
+            # # transform holds from reference to current frame
+            # if not self.static_video:
+            #     T_ref_to_curr: np.ndarray = self.relative_motion[(ref_frame_id, curr_frame_id)]
+            #     ref_holds_in_frame: np.ndarray = (np.linalg.inv(T_ref_to_curr) @ ref_centers_H)[:2]
+            # else:
+            #     ref_holds_in_frame = ref_centers
+            #
+            # targ_positions = np.array([h.get_center() for h in frame_data.holds])
+            # kdtree = cKDTree(targ_positions)
+            # # Find the 2 nearest neighbors for each feature in the second set
+            # distances, indices = kdtree.query(ref_holds_in_frame.T, k=3)
+            # for ref_hold_idx, (dist, matched_targ_indices) in enumerate(zip(distances,indices)):
+            #     if dist[0] < 10.0:
+            #         frame_data.holds[matched_targ_indices[0]].id = ref_holds[ref_hold_idx].id
+            #
+            # ref_frame_id = curr_frame_id
+            # ref_centers_H: np.ndarray = np.hstack((targ_positions, np.ones((len(frame_data.holds), 1)))).T
+            # ref_holds = frame_data.holds
+            #
+            # # a=3
+            # # get holds embeddings
+            # # matched_holds = []
+            # # target_holds: List[HoldBBox] = frame_data.get_holds_near_climber()
+            # # embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in target_holds])
+            # # k_neighbors: int = 5
+            # # distances, indices, metadata = self.vector_db.search(embeddings, k=k_neighbors)
+            # # for targ_hold_idx, matched_ref_indices in enumerate(indices.squeeze()):
+            # #     targ_hold: HoldBBox = target_holds[targ_hold_idx]
+            # #     candidates_positions = ref_holds_in_frame[:, matched_ref_indices]
+            # #     candidate_distances = candidates_positions.T - targ_hold.get_center()
+            # #     matched_ref = np.argmin(np.linalg.norm(candidate_distances, axis=1))
+            # #     if matched_ref_indices[matched_ref] not in matched_holds:
+            # #         targ_hold.id = curr_holds[matched_ref_indices[matched_ref]].id
+            # #         matched_holds.append(matched_ref_indices[matched_ref])
+            # #     else:
+            # #         pass
 
 
 
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
-                                            try_to_load_from_disk=True,
+                                            try_to_load_from_disk=False,
                                             images_dir='downloaded_frames_tag',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
@@ -717,6 +825,6 @@ if __name__ == "__main__":
                                             detector_threshold=.1,
                                             superglue_model='outdoor',
                                             mask_for_matching=False,
-                                            max_frames=100)
+                                            max_frames=200)
     chalk_gpt: ChalkGpt = ChalkGpt(config)
     chalk_gpt.main()
