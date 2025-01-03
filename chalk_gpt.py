@@ -582,6 +582,12 @@ class ChalkGpt:
         for frame_id, frame_data in tqdm.tqdm(self.frames_data.items(), total=len(self.frames_data)):
             frame_data.holds = self.detect_holds(frame_id=frame_id,im_path=frame_data.im_path)
 
+    def find_holds_near_climber(self, climber_mask: np.ndarray, holds: List[HoldBBox]):
+        bbox = get_bounding_box(mask=climber_mask, pad=50)
+        for hold in holds:
+            if np.linalg.norm(hold.get_center() - bbox.get_center()) < self.config.hold_to_traj_association_distance_px:
+                hold.is_near_climber = True
+
     def process_frames(self, frame_names):
         inference_state = self.predictor.init_state(video_path=self.config.images_dir, offload_video_to_cpu=True,
                                                     offload_state_to_cpu=True)
@@ -595,22 +601,10 @@ class ChalkGpt:
             if self.config.max_frames is not None and out_frame_idx >= self.config.max_frames:
                 break
             video_segments[out_frame_idx] = {out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy() for i, out_obj_id in enumerate(out_obj_ids)}
-            for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-                out_mask = out_mask.squeeze()
+            for out_obj_id, climber_mask in video_segments[out_frame_idx].items():
+                climber_mask = climber_mask.squeeze()
                 if out_obj_id == self.CLIMBER_OBJECT_ID:
-                    bbox = get_bounding_box(mask=out_mask, pad=50)
-                    frame_data = self.frames_data[out_frame_idx]
-                    holds_near_climber = []
-                    for hold in frame_data.holds:
-                        if np.linalg.norm(hold.get_center() - bbox.get_center()) < self.config.hold_to_traj_association_distance_px:
-                            hold.is_near_climber = True
-                            holds_near_climber.append(hold)
-
-                    if False and out_frame_idx == 0:
-                        # bottom-up holds indexing
-                        holds_near_climber = sorted(holds_near_climber, key=lambda x: x.get_center()[1], reverse=True)
-                        for hold_id, h in enumerate(holds_near_climber):
-                            h.id = f'{out_frame_idx}_{hold_id}'
+                    self.find_holds_near_climber(climber_mask, self.frames_data[out_frame_idx].holds)
 
         return video_segments
 
@@ -652,14 +646,7 @@ class ChalkGpt:
         for box in yolo_res.boxes:
             box: HoldBBox = HoldBBox.from_ultralytics_bbox(ultralytics_bbox=box, id=f'{frame_id}.{HoldBBox.next_id()}')
             out.append(box)
-
         return out
-        #
-        # embeddings = self.img2vec.get_vec([Image.fromarray(b.get_image_crop(im_bgr)) for b in out], tensor=True)
-        # embeddings /= torch.norm(embeddings, p=2, dim=1, keepdim=True)
-        # for embedding, box in zip(embeddings, out):
-        #     box.embedding = embedding.squeeze()
-        # return out
 
     def visualize(self, video_segments, frame_names):
         world_frame: np.ndarray = self.get_world_frame(frame_names)
@@ -775,45 +762,9 @@ class ChalkGpt:
                 frame_data.holds[hold_idx].id = self.holds_world[world_idx].id
                 frame_data.holds[hold_idx].is_labeled = True
 
-            # # transform holds from reference to current frame
-            # if not self.static_video:
-            #     T_ref_to_curr: np.ndarray = self.relative_motion[(ref_frame_id, curr_frame_id)]
-            #     ref_holds_in_frame: np.ndarray = (np.linalg.inv(T_ref_to_curr) @ ref_centers_H)[:2]
-            # else:
-            #     ref_holds_in_frame = ref_centers
-            #
-            # targ_positions = np.array([h.get_center() for h in frame_data.holds])
-            # kdtree = cKDTree(targ_positions)
-            # # Find the 2 nearest neighbors for each feature in the second set
-            # distances, indices = kdtree.query(ref_holds_in_frame.T, k=3)
-            # for ref_hold_idx, (dist, matched_targ_indices) in enumerate(zip(distances,indices)):
-            #     if dist[0] < 10.0:
-            #         frame_data.holds[matched_targ_indices[0]].id = ref_holds[ref_hold_idx].id
-            #
-            # ref_frame_id = curr_frame_id
-            # ref_centers_H: np.ndarray = np.hstack((targ_positions, np.ones((len(frame_data.holds), 1)))).T
-            # ref_holds = frame_data.holds
-            #
-            # # a=3
-            # # get holds embeddings
-            # # matched_holds = []
-            # # target_holds: List[HoldBBox] = frame_data.get_holds_near_climber()
-            # # embeddings: np.ndarray = np.array([hold.embedding.cpu().numpy() for hold in target_holds])
-            # # k_neighbors: int = 5
-            # # distances, indices, metadata = self.vector_db.search(embeddings, k=k_neighbors)
-            # # for targ_hold_idx, matched_ref_indices in enumerate(indices.squeeze()):
-            # #     targ_hold: HoldBBox = target_holds[targ_hold_idx]
-            # #     candidates_positions = ref_holds_in_frame[:, matched_ref_indices]
-            # #     candidate_distances = candidates_positions.T - targ_hold.get_center()
-            # #     matched_ref = np.argmin(np.linalg.norm(candidate_distances, axis=1))
-            # #     if matched_ref_indices[matched_ref] not in matched_holds:
-            # #         targ_hold.id = curr_holds[matched_ref_indices[matched_ref]].id
-            # #         matched_holds.append(matched_ref_indices[matched_ref])
-            # #     else:
-            # #         pass
 
-
-
+# TODO - holds near climber should be detected using distance from climber polygon (instead of radial distance from bbox center)
+# TODO - holds occlusion should be handled using climber polygon
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
