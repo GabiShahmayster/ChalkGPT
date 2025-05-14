@@ -3,7 +3,6 @@ import dataclasses
 import enum
 import os
 import pickle
-import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 import random
@@ -13,41 +12,96 @@ import numpy as np
 import super_gradients
 import torch
 import tqdm
-import ultralytics.engine.results
-from comet_ml.logging_extensions.rich_decoration.environment import width
 from img2vec_pytorch import Img2Vec
 from matplotlib import pyplot as plt
-from PIL import Image
 from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
 from super_gradients.training.utils.predict import ImagePoseEstimationPrediction
-from sympy.integrals.risch import residue_reduce_to_basic
-from torchvision.utils import draw_bounding_boxes
 from ultralytics import YOLO
-from ultralytics.engine.results import Results, Boxes
-
-from lightglue import LightGlue
+from ultralytics.engine.results import Results
 from mouse_click import select_pixel
-# from mouse_click import get_mouse_click_coords
 from sam2.build_sam import build_sam2_video_predictor
-from dataclasses import dataclass
-
 from src.base import KeypointData, KeypointMatchingResults
 from src.superglue import SuperGlue
 from src.superpoint import SuperPoint
 from vector_db import FAISSIndex
 from video_extractor import extract_video_frames
+from shapely.geometry import Polygon, MultiPolygon
+
+from shapely.geometry import Polygon
+import shapely.affinity as affinity
+
+
+def transform_polygon(polygon, m):
+    """
+    Apply an affine transformation to a Shapely polygon.
+
+    Parameters:
+    -----------
+    polygon : shapely.geometry.Polygon
+        The polygon to transform.
+    matrix : list or tuple, optional
+        A 6-element list or tuple specifying the affine transformation matrix
+        in the order [a, b, d, e, xoff, yoff] for the equation:
+        x' = a*x + b*y + xoff
+        y' = d*x + e*y + yoff
+    Returns:
+    --------
+    shapely.geometry.Polygon
+        The transformed polygon.
+    """
+    # Apply affine transform using a 6-element matrix
+    mat_elements = m[0,0], m[0, 1], m[1, 0], m[1, 1], m[0, 2], m[1, 2]
+    try:
+        return affinity.affine_transform(polygon, mat_elements)
+    except:
+        a=3
+
+def bbox_to_polygon(top_left, bottom_right):
+    """
+    Convert a bounding box defined by its top-left and bottom-right corners to a Shapely polygon.
+
+    Parameters:
+    -----------
+    top_left : tuple
+        (x, y) coordinates of the top-left corner of the bounding box.
+    bottom_right : tuple
+        (x, y) coordinates of the bottom-right corner of the bounding box.
+
+    Returns:
+    --------
+    shapely.geometry.Polygon
+        Shapely polygon representing the bounding box.
+    """
+    # Extract coordinates
+    x_min, y_min = top_left
+    x_max, y_max = bottom_right
+
+    # Create polygon coordinates (going clockwise from top-left)
+    coords = [
+        (x_min, y_min),  # top-left
+        (x_max, y_min),  # top-right
+        (x_max, y_max),  # bottom-right
+        (x_min, y_max),  # bottom-left
+        (x_min, y_min)  # closing the loop by returning to top-left
+    ]
+
+    # Create and return the polygon
+    return Polygon(coords)
 
 class BoundingBox:
     top_left: tuple
     bottom_right: tuple
+    polygon: Polygon
     width_px: int = None
     height_px: int = None
+
     def __init__(self, top_left: tuple, bottom_right: tuple, width_px: int = None, height_px: int = None):
         self.top_left = top_left
         self.bottom_right =bottom_right
         self.width_px = width_px
         self.height_px = height_px
+        self.polygon = bbox_to_polygon(top_left=top_left, bottom_right=bottom_right)
 
     def __post_init__(self):
         self.width_px = self.bottom_right[0] - self.top_left[0]
@@ -382,6 +436,64 @@ def cluster_coordinates(coordinates, eps=0.5, min_samples=5):
 
     return labels, n_clusters
 
+def is_bbox_occluded_by_mask(mask: Polygon, bbox: BoundingBox) -> bool:
+    return not mask.intersects(bbox)
+
+def distance_bbox_from_mask(mask: Polygon, bbox: BoundingBox) -> float:
+    return bbox.polygon.distance(mask)
+
+def mask_to_polygon(mask_image, simplify_tolerance=None):
+    """
+    Convert a binary mask image to a Shapely polygon.
+
+    Parameters:
+    -----------
+    mask_image : numpy.ndarray
+        Binary mask image where non-zero pixels represent the area to convert to polygon.
+    simplify_tolerance : float, optional
+        Tolerance parameter for simplifying the polygon. If None, no simplification is performed.
+        Higher values result in more simplification.
+
+    Returns:
+    --------
+    shapely.geometry.Polygon or shapely.geometry.MultiPolygon
+        Shapely polygon(s) representing the mask.
+    """
+    # Ensure the mask is binary
+    if mask_image.dtype != np.bool_:
+        mask_image = mask_image.astype(bool)
+
+    # Find contours in the mask
+    contours, _ = cv2.findContours(
+        mask_image.astype(np.uint8),
+        cv2.RETR_EXTERNAL,  # Only retrieve the external contours
+        cv2.CHAIN_APPROX_SIMPLE  # Compress horizontal, vertical, and diagonal segments
+    )
+
+    # Convert contours to polygons
+    polygons = []
+    for contour in contours:
+        # Convert contour to a list of (x, y) tuples
+        coords = [(point[0][0], point[0][1]) for point in contour]
+
+        # Create a polygon (must have at least 3 points)
+        if len(coords) >= 3:
+            poly = Polygon(coords)
+
+            # Simplify polygon if tolerance is provided
+            if simplify_tolerance is not None and poly.is_valid:
+                poly = poly.simplify(simplify_tolerance, preserve_topology=True)
+
+            if poly.is_valid and not poly.is_empty:
+                polygons.append(poly)
+
+    # Return the appropriate geometry
+    if len(polygons) == 0:
+        return None
+    elif len(polygons) == 1:
+        return polygons[0]
+    else:
+        return MultiPolygon(polygons)
 
 
 class ChalkGpt:
@@ -392,7 +504,7 @@ class ChalkGpt:
     pose_estimator: object
     yolo_pose: object
     yolo_holds: object
-    vector_db: FAISSIndex
+    # vector_db: FAISSIndex
     random_labels_generator: RandomLabelsGenerator
     static_video: bool
     CLIMBER_OBJECT_ID = 1
@@ -414,7 +526,7 @@ class ChalkGpt:
         self.yolo_pose.eval()
 
         self.img2vec = Img2Vec(cuda=config.device is torch.device('cuda:0'), model='resnet-18')
-        self.vector_db = FAISSIndex(dimension=512, index_type='cosine')
+        # self.vector_db = FAISSIndex(dimension=512, index_type='cosine')
 
         self.yolo_holds = YOLO("weights/holds/v1/weights/best.pt")
         # self.yolo_shoes = YOLO("weights/shoes/v0/weights/best.pt")
@@ -659,14 +771,19 @@ class ChalkGpt:
                     continue
                 blended_frame = hold.draw_on_image(im=blended_frame, label=f'{hold.id}')
 
-            for out_obj_id, out_mask in video_segments[out_frame_idx].items():
-                out_mask = out_mask.squeeze()
+            mask_polygon = None
+            for out_obj_id, mask in video_segments[out_frame_idx].items():
+                mask = mask.squeeze()
+                new_polygon = mask_to_polygon(mask)
+                if mask_polygon is None and new_polygon is not None:
+                      mask_polygon = new_polygon
+
                 if out_obj_id == self.HOLDS_OBJECT_ID:
                     pass
                     # mask_3d = np.stack((0 * out_mask, out_mask, 0 * out_mask), axis=2).astype(np.uint8)
                     # blended_frame = cv2.blendLinear(blended_frame, 255 * mask_3d, 0.5 * np.ones_like(out_mask, dtype=np.float32),0.5 * np.ones_like(out_mask, dtype=np.float32))
                 elif out_obj_id == self.CLIMBER_OBJECT_ID:
-                    bbox = get_bounding_box(mask=out_mask, pad=50)
+                    bbox = get_bounding_box(mask=mask, pad=50)
                     world_frame_with_climber = np.array(world_frame)
                     end_row = world_frame_with_climber.shape[0]
                     if self.H_ext != 0:
@@ -678,17 +795,21 @@ class ChalkGpt:
                     T = self.transform_to_world[out_frame_idx][:2]
                     bbox.apply_transform(T=self.get_world_frame_placement_transform())
                     bbox.apply_transform(T=T)
+
+                    mask_polygon_world = transform_polygon(mask_polygon, self.get_world_frame_placement_transform())
+                    mask_polygon_world = transform_polygon(mask_polygon_world, T)
+
                     world_frame_final = cv2.warpAffine(world_frame_with_climber, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
                     climber_crop = world_frame_final[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
-                    world_frame_final = draw_holds_on_image(world_frame_final, [h for h in self.holds_world if np.linalg.norm(h.get_center()-bbox.get_center()) < self.config.hold_to_traj_association_distance_px])
+                    world_frame_final = draw_holds_on_image(world_frame_final, [h for h in self.holds_world if distance_bbox_from_mask(mask_polygon_world, h) < self.config.hold_to_traj_association_distance_px])
                     cv2.imshow("world frame", world_frame_final)
 
                     pose: ImagePoseEstimationPrediction = self.yolo_pose.predict(climber_crop, conf=0.3, fuse_model=False, batch_size=1)
                     pose_draw = pose.draw()
                     cv2.imshow("climber pose", pose_draw)
-                    mask_3d = np.stack((0 * out_mask, 0 * out_mask, out_mask), axis=2).astype(np.uint8)
-                    blended_frame = cv2.blendLinear(blended_frame, 255 * mask_3d, 0.5 * np.ones_like(out_mask, dtype=np.float32),
-                                            0.5 * np.ones_like(out_mask, dtype=np.float32))
+                    mask_3d = np.stack((0 * mask, 0 * mask, mask), axis=2).astype(np.uint8)
+                    blended_frame = cv2.blendLinear(blended_frame, 255 * mask_3d, 0.5 * np.ones_like(mask, dtype=np.float32),
+                                            0.5 * np.ones_like(mask, dtype=np.float32))
 
             cv2.imshow("blended frame", blended_frame)
 
@@ -763,12 +884,11 @@ class ChalkGpt:
                 frame_data.holds[hold_idx].is_labeled = True
 
 
-# TODO - holds near climber should be detected using distance from climber polygon (instead of radial distance from bbox center)
 # TODO - holds occlusion should be handled using climber polygon
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
-                                            try_to_load_from_disk=False,
+                                            try_to_load_from_disk=True,
                                             images_dir='downloaded_frames_tag',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
@@ -776,6 +896,6 @@ if __name__ == "__main__":
                                             detector_threshold=.1,
                                             superglue_model='outdoor',
                                             mask_for_matching=False,
-                                            max_frames=200)
+                                            max_frames=None)
     chalk_gpt: ChalkGpt = ChalkGpt(config)
     chalk_gpt.main()
