@@ -126,11 +126,11 @@ class BoundingBox:
 
     def draw_on_image(self,
             im: np.ndarray,
-            color: Tuple[int, int, int] = (0, 0, 0),  # Default green color
+            color: Tuple[int] = (0, 0, 0),  # Default green color
             thickness: int = 2,
             label: str = None,
             font_scale: float = 0.5,
-            text_color: Tuple[int, int, int] = (255, 255, 255),  # White text
+            text_color: Tuple[int] = (255, 255, 255),  # White text
             text_thickness: int = 1
     ) -> np.ndarray:
         """
@@ -238,10 +238,10 @@ class HoldBBox(BoundingBox):
         cls.global_uid += 1
         return cls.global_uid
 
-    def draw_on_image(self,**kwargs):
+    def draw_on_image(self,color: Tuple[int]=(0,0,0),text_color: Tuple[int]=(255,255,255),**kwargs):
         if kwargs.get('label') is None:
             kwargs['label'] = '' if self.id is None else f"{self.id}"
-        return BoundingBox.draw_on_image(self, **kwargs)
+        return BoundingBox.draw_on_image(self, color=color, text_color=text_color, **kwargs)
 
     @classmethod
     def from_ultralytics_bbox(cls, ultralytics_bbox, id: int = None) -> 'HoldBBox':
@@ -256,10 +256,10 @@ def get_holds_centers(holds: List[HoldBBox], return_homogeneous: bool = False) -
     else:
         return np.array([h.get_center() for h in holds]).T
 
-def draw_holds_on_image(im: np.ndarray, holds: List[HoldBBox] = None):
+def draw_holds_on_image(im: np.ndarray, holds: List[HoldBBox] = None, color: Tuple[int] = (128, 128, 128),text_color: Tuple[int]=(255,255,255)):
     out = np.array(im)
     for h in holds:
-        out = h.draw_on_image(im=out)
+        out = h.draw_on_image(im=out, color=color, text_color=text_color)
     return out
 
 def show_mask(mask, ax, obj_id=None, random_color=False):
@@ -390,17 +390,17 @@ class FrameData:
 
     def get_image(self) -> np.ndarray:
         return cv2.imread(self.im_path)
-
-    def get_holds_near_climber(self):
-        return [h for h in self.holds if h.is_near_climber]
-
-    def draw_holds_on_image(self, holds: List[HoldBBox] = None) -> np.ndarray:
-        if holds is None:
-            holds = self.holds
-        out: np.ndarray = self.get_image()
-        for h in holds:
-            out = h.draw_on_image(im=out)
-        return out
+    #
+    # def get_holds_near_climber(self):
+    #     return [h for h in self.holds if h.is_near_climber]
+    #
+    # def draw_holds_on_image(self, holds: List[HoldBBox] = None) -> np.ndarray:
+    #     if holds is None:
+    #         holds = self.holds
+    #     out: np.ndarray = self.get_image()
+    #     for h in holds:
+    #         out = h.draw_on_image(im=out)
+    #     return out
 
 
 
@@ -576,13 +576,10 @@ class ChalkGpt:
             self.visualize(video_segments=video_segments, frame_names=frame_names)
 
     def label_all_holds(self):
-        all_holds = []
-        label_to_id = {}
         T_init_world = self.get_world_frame_placement_transform(return_homogeneous=True)
         all_centers = None
         for frame_id, frame_data in self.frames_data.items():
             temp_holds = [h for h in frame_data.holds if h.is_near_climber]
-            all_holds += temp_holds
             centers_frame = get_holds_centers(temp_holds, return_homogeneous=True)
             centers_world = self.transform_to_world[frame_id] @ T_init_world @ centers_frame
             if all_centers is None:
@@ -590,27 +587,15 @@ class ChalkGpt:
             else:
                 all_centers = np.hstack((all_centers, centers_world))
         labels, n_clusters = cluster_coordinates(all_centers.T, eps=10.0, min_samples=2)
+        centers_final = []
         for lbl in set(labels):
             if lbl==-1:
                 continue
-            center = np.mean(all_centers[:2, labels==lbl], axis=1)
-            for idx, c_id in enumerate(labels):
-                if c_id == lbl and label_to_id.get(lbl) is None:
-                    label_to_id[lbl] = all_holds[idx].id
-                    continue
-            self.holds_world.append(HoldBBox(top_left=center-np.array([10,10]), bottom_right=center+np.array([10,10]), id=label_to_id[lbl]))
+            centers_final.append(np.mean(all_centers[:2, labels==lbl], axis=1))
+        centers_final = sorted(centers_final, reverse=True, key=lambda x: x[1])
+        for center in centers_final:
+            self.holds_world.append(HoldBBox(top_left=center-np.array([10,10]), bottom_right=center+np.array([10,10]), id=f'hold_{HoldBBox.next_id()}'))
 
-        for hold, label in zip(all_holds, labels):
-            if label == -1:
-                continue
-            hold.id = label_to_id[label]
-            hold.is_labeled = True
-
-        for frame_data in self.frames_data.values():
-            holds_to_keep = []
-            for hold in frame_data.holds:
-                if hold.is_labeled:
-                    holds_to_keep.append(hold)
 
 
 
@@ -694,10 +679,9 @@ class ChalkGpt:
         for frame_id, frame_data in tqdm.tqdm(self.frames_data.items(), total=len(self.frames_data)):
             frame_data.holds = self.detect_holds(frame_id=frame_id,im_path=frame_data.im_path)
 
-    def find_holds_near_climber(self, climber_mask: np.ndarray, holds: List[HoldBBox]):
-        bbox = get_bounding_box(mask=climber_mask, pad=50)
+    def find_holds_near_climber(self, mask_polygon: Polygon, holds: List[HoldBBox]):
         for hold in holds:
-            if np.linalg.norm(hold.get_center() - bbox.get_center()) < self.config.hold_to_traj_association_distance_px:
+            if distance_bbox_from_mask(mask_polygon, hold) < self.config.hold_to_traj_association_distance_px:
                 hold.is_near_climber = True
 
     def process_frames(self, frame_names):
@@ -706,18 +690,16 @@ class ChalkGpt:
         self.manually_select_object(inference_state, tracked_obj=TrackedObjectType.Climber, frame_idx=0,
                                     frame_names=frame_names)
         self.find_holds_all_frames(frame_names)
-        # self.localize_holds_using_yolo(inference_state, frame_idx=0,
-        #                             frame_names=frame_names)
         video_segments = {}
         for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(inference_state):
             if self.config.max_frames is not None and out_frame_idx >= self.config.max_frames:
                 break
             video_segments[out_frame_idx] = {out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy() for i, out_obj_id in enumerate(out_obj_ids)}
-            for out_obj_id, climber_mask in video_segments[out_frame_idx].items():
-                climber_mask = climber_mask.squeeze()
+            for out_obj_id, mask in video_segments[out_frame_idx].items():
+                mask = mask.squeeze()
+                mask_polygon = mask_to_polygon(mask)
                 if out_obj_id == self.CLIMBER_OBJECT_ID:
-                    self.find_holds_near_climber(climber_mask, self.frames_data[out_frame_idx].holds)
-
+                    self.find_holds_near_climber(mask_polygon, self.frames_data[out_frame_idx].holds)
         return video_segments
 
     def define_world_frame(self):
@@ -751,12 +733,12 @@ class ChalkGpt:
             return np.vstack((out, np.array([.0, .0, 1.0])))
 
     def detect_holds(self, frame_id:int, im_path: str):
-        im_bgr: np.ndarray = cv2.cvtColor(cv2.imread(im_path), cv2.COLOR_BGR2RGB)
+        # im_bgr: np.ndarray = cv2.cvtColor(cv2.imread(im_path), cv2.COLOR_BGR2RGB)
         yolo_res: Results = self.yolo_holds(im_path)[0]
         out: List[HoldBBox] = []
-        detected_holds = yolo_res.boxes
-        for box in yolo_res.boxes:
-            box: HoldBBox = HoldBBox.from_ultralytics_bbox(ultralytics_bbox=box, id=f'{frame_id}.{HoldBBox.next_id()}')
+        # detected_holds = yolo_res.boxes
+        for id, box in enumerate(yolo_res.boxes):
+            box: HoldBBox = HoldBBox.from_ultralytics_bbox(ultralytics_bbox=box, id=f'{frame_id}.{id}')
             out.append(box)
         return out
 
@@ -803,6 +785,14 @@ class ChalkGpt:
                     climber_crop = world_frame_final[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
                     world_frame_final = draw_holds_on_image(world_frame_final, [h for h in self.holds_world if distance_bbox_from_mask(mask_polygon_world, h) < self.config.hold_to_traj_association_distance_px])
                     cv2.imshow("world frame", world_frame_final)
+
+                    skeleton_world_frame = 0*world_frame_final
+                    skeleton_world_frame[self.H_ext:end_row,self.W_ext:end_col] = np.tile(np.expand_dims(mask,2),[1,1,3]).astype(np.uint8)*255
+                    skeleton_world_frame = cv2.warpAffine(skeleton_world_frame, T, (skeleton_world_frame.shape[1], skeleton_world_frame.shape[0]), cv2.INTER_LINEAR)
+
+                    # mask_world = cv2.warpAffine(np.tile(np.expand_dims(mask,2),[1,1,3]).astype(np.uint8)*255, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
+                    skeleton_world_frame = draw_holds_on_image(skeleton_world_frame, self.holds_world)
+                    cv2.imshow("skeleton", skeleton_world_frame)
 
                     pose: ImagePoseEstimationPrediction = self.yolo_pose.predict(climber_crop, conf=0.3, fuse_model=False, batch_size=1)
                     pose_draw = pose.draw()
@@ -896,6 +886,6 @@ if __name__ == "__main__":
                                             detector_threshold=.1,
                                             superglue_model='outdoor',
                                             mask_for_matching=False,
-                                            max_frames=None)
+                                            max_frames=50)
     chalk_gpt: ChalkGpt = ChalkGpt(config)
     chalk_gpt.main()
