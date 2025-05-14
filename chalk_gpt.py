@@ -55,7 +55,7 @@ def transform_polygon(polygon, m):
     try:
         return affinity.affine_transform(polygon, mat_elements)
     except:
-        a=3
+        return None
 
 def bbox_to_polygon(top_left, bottom_right):
     """
@@ -437,7 +437,7 @@ def cluster_coordinates(coordinates, eps=0.5, min_samples=5):
     return labels, n_clusters
 
 def is_bbox_occluded_by_mask(mask: Polygon, bbox: BoundingBox) -> bool:
-    return not mask.intersects(bbox)
+    return mask.intersects(bbox.polygon)
 
 def distance_bbox_from_mask(mask: Polygon, bbox: BoundingBox) -> float:
     return bbox.polygon.distance(mask)
@@ -781,27 +781,34 @@ class ChalkGpt:
                     mask_polygon_world = transform_polygon(mask_polygon, self.get_world_frame_placement_transform())
                     mask_polygon_world = transform_polygon(mask_polygon_world, T)
 
-                    world_frame_final = cv2.warpAffine(world_frame_with_climber, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
-                    climber_crop = world_frame_final[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
-                    world_frame_final = draw_holds_on_image(world_frame_final, [h for h in self.holds_world if distance_bbox_from_mask(mask_polygon_world, h) < self.config.hold_to_traj_association_distance_px])
-                    cv2.imshow("world frame", world_frame_final)
+                    if False:
+                        world_frame_final = cv2.warpAffine(world_frame_with_climber, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
+                        climber_crop = world_frame_final[bbox.top_left[1]:bbox.bottom_right[1], bbox.top_left[0]:bbox.bottom_right[0]]
+                        world_frame_final = draw_holds_on_image(world_frame_final, [h for h in self.holds_world if distance_bbox_from_mask(mask_polygon_world, h) < self.config.hold_to_traj_association_distance_px])
+                        cv2.imshow("world frame", world_frame_final)
 
-                    skeleton_world_frame = 0*world_frame_final
-                    skeleton_world_frame[self.H_ext:end_row,self.W_ext:end_col] = np.tile(np.expand_dims(mask,2),[1,1,3]).astype(np.uint8)*255
-                    skeleton_world_frame = cv2.warpAffine(skeleton_world_frame, T, (skeleton_world_frame.shape[1], skeleton_world_frame.shape[0]), cv2.INTER_LINEAR)
+                    if mask_polygon_world is not None:
+                        skeleton_world_frame = 0*world_frame_with_climber
+                        contours, hierarchy = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        # Draw contours on an empty image (optional visualization)
+                        contour_image = np.zeros_like(mask, dtype=np.uint8)
+                        contour_image = cv2.drawContours(contour_image, contours, -1, 255, 1)
+                        skeleton_world_frame[self.H_ext:end_row,self.W_ext:end_col] = np.tile(np.expand_dims(contour_image,2),[1,1,3])
+                        skeleton_world_frame = cv2.warpAffine(skeleton_world_frame, T, (skeleton_world_frame.shape[1], skeleton_world_frame.shape[0]), cv2.INTER_LINEAR)
+                        # mask_world = cv2.warpAffine(np.tile(np.expand_dims(mask,2),[1,1,3]).astype(np.uint8)*255, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
+                        skeleton_world_frame = draw_holds_on_image(skeleton_world_frame, [h for h in self.holds_world if not is_bbox_occluded_by_mask(mask=mask_polygon_world, bbox=h)])
+                        cv2.imshow("skeleton", skeleton_world_frame)
+                    cv2.imshow("original",raw_frame)
 
-                    # mask_world = cv2.warpAffine(np.tile(np.expand_dims(mask,2),[1,1,3]).astype(np.uint8)*255, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
-                    skeleton_world_frame = draw_holds_on_image(skeleton_world_frame, self.holds_world)
-                    cv2.imshow("skeleton", skeleton_world_frame)
-
-                    pose: ImagePoseEstimationPrediction = self.yolo_pose.predict(climber_crop, conf=0.3, fuse_model=False, batch_size=1)
-                    pose_draw = pose.draw()
-                    cv2.imshow("climber pose", pose_draw)
-                    mask_3d = np.stack((0 * mask, 0 * mask, mask), axis=2).astype(np.uint8)
-                    blended_frame = cv2.blendLinear(blended_frame, 255 * mask_3d, 0.5 * np.ones_like(mask, dtype=np.float32),
-                                            0.5 * np.ones_like(mask, dtype=np.float32))
-
-            cv2.imshow("blended frame", blended_frame)
+                    if False:
+                        pose: ImagePoseEstimationPrediction = self.yolo_pose.predict(climber_crop, conf=0.3, fuse_model=False, batch_size=1)
+                        pose_draw = pose.draw()
+                        cv2.imshow("climber pose", pose_draw)
+                        mask_3d = np.stack((0 * mask, 0 * mask, mask), axis=2).astype(np.uint8)
+                        blended_frame = cv2.blendLinear(blended_frame, 255 * mask_3d, 0.5 * np.ones_like(mask, dtype=np.float32),
+                                                0.5 * np.ones_like(mask, dtype=np.float32))
+            if False:
+                cv2.imshow("blended frame", blended_frame)
 
             while True:
                  key = cv2.waitKey(1) & 0xFF
@@ -886,6 +893,6 @@ if __name__ == "__main__":
                                             detector_threshold=.1,
                                             superglue_model='outdoor',
                                             mask_for_matching=False,
-                                            max_frames=50)
+                                            max_frames=None)
     chalk_gpt: ChalkGpt = ChalkGpt(config)
     chalk_gpt.main()
