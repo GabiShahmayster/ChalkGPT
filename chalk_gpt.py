@@ -24,6 +24,7 @@ from sam2.build_sam import build_sam2_video_predictor
 from src.base import KeypointData, KeypointMatchingResults
 from src.superglue import SuperGlue
 from src.superpoint import SuperPoint
+from src.video_writer import VideoWriterChalkGpt, add_clock_to_image
 from vector_db import FAISSIndex
 from video_extractor import extract_video_frames
 from shapely.geometry import Polygon, MultiPolygon
@@ -320,8 +321,10 @@ class ChalkGptConfig:
     superglue_model: str = 'outdoor'
     mask_for_matching: bool = False
     max_frames: int = None
-    hold_to_traj_association_distance_px: float = 100
+    hold_to_traj_association_distance_px: float = 10
     static_video_shift_thr_px: float = 10.0
+    save_video_path: str = None
+    video_fps: int = 30
 
     def __post_init__(self):
         assert self.images_dir is not None or self.video_file is not None, "must provide video/frames path"
@@ -436,8 +439,9 @@ def cluster_coordinates(coordinates, eps=0.5, min_samples=5):
 
     return labels, n_clusters
 
-def is_bbox_occluded_by_mask(mask: Polygon, bbox: BoundingBox) -> bool:
-    return mask.intersects(bbox.polygon)
+def is_bbox_occluded_by_mask(mask: Polygon, bbox: BoundingBox, max_iou: float = .8) -> bool:
+    iou = mask.intersection(bbox.polygon).area / bbox.polygon.area
+    return iou > max_iou
 
 def distance_bbox_from_mask(mask: Polygon, bbox: BoundingBox) -> float:
     return bbox.polygon.distance(mask)
@@ -496,6 +500,40 @@ def mask_to_polygon(mask_image, simplify_tolerance=None):
         return MultiPolygon(polygons)
 
 
+def join_images(world_image, raw_image):
+    """
+    Join two RGB images side by side.
+
+    Args:
+        world_image (numpy.ndarray): Left image (taller than image_2)
+        raw_image (numpy.ndarray): Right image
+
+    Returns:
+        numpy.ndarray: Combined image with image_2 centered vertically
+    """
+    # Get dimensions of the images
+    h1, w1 = world_image.shape[:2]
+    h2, w2 = raw_image.shape[:2]
+
+    # Ensure image_1 is taller than image_2
+    if h1 <= h2:
+        raise ValueError("image_1 must be taller than image_2")
+
+    # Calculate padding needed for image_2
+    padding_top = (h1 - h2) // 2
+    padding_bottom = h1 - h2 - padding_top  # Account for odd difference
+
+    # Create a black canvas for image_2 with padding
+    padded_image_2 = np.zeros((h1, w2, 3), dtype=np.uint8)
+
+    # Place image_2 in the center of the padded area
+    padded_image_2[padding_top:padding_top + h2, :] = raw_image
+
+    # Concatenate the images horizontally
+    combined_image = np.hstack((world_image, padded_image_2))
+
+    return combined_image
+
 class ChalkGpt:
     frames_data: Dict[int, FrameData]
 
@@ -514,6 +552,8 @@ class ChalkGpt:
     H_ext: int
     W_ext: int
     holds_world: List[HoldBBox]
+
+    video_writer: VideoWriterChalkGpt
 
     def   __init__(self, config: ChalkGptConfig):
         self.config = config
@@ -545,6 +585,11 @@ class ChalkGpt:
                 extract_video_frames(config.video_file, output_dir)
             config.images_dir = output_dir
 
+        if config.save_video_path is not None:
+            output_path = os.path.join(config.save_video_path, config.images_dir)
+            os.makedirs(output_path, exist_ok=True)
+            self.video_writer = VideoWriterChalkGpt(output_path=os.path.join(output_path,'chalk_gpt.mp4'))
+
     def main(self):
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             process_frames: bool = True
@@ -574,6 +619,8 @@ class ChalkGpt:
             self.label_all_holds()
             self.match_holds()
             self.visualize(video_segments=video_segments, frame_names=frame_names)
+        if self.video_writer is not None:
+            self.video_writer.release()
 
     def label_all_holds(self):
         T_init_world = self.get_world_frame_placement_transform(return_homogeneous=True)
@@ -594,7 +641,7 @@ class ChalkGpt:
             centers_final.append(np.mean(all_centers[:2, labels==lbl], axis=1))
         centers_final = sorted(centers_final, reverse=True, key=lambda x: x[1])
         for center in centers_final:
-            self.holds_world.append(HoldBBox(top_left=center-np.array([10,10]), bottom_right=center+np.array([10,10]), id=f'hold_{HoldBBox.next_id()}'))
+            self.holds_world.append(HoldBBox(top_left=center-np.array([10,10]), bottom_right=center+np.array([10,10]), id=f'h{HoldBBox.next_id()}'))
 
 
 
@@ -726,7 +773,7 @@ class ChalkGpt:
     def get_world_frame_placement_transform(self, return_homogeneous: bool = False) -> np.ndarray:
         out: np.ndarray = np.hstack((np.eye(2), np.zeros((2,1))))
         out[0, 2] = self.W_ext
-        out[1, 2] = self.H_ext
+        out[1, 2] = 2*self.H_ext
         if not return_homogeneous:
             return out
         else:
@@ -734,7 +781,7 @@ class ChalkGpt:
 
     def detect_holds(self, frame_id:int, im_path: str):
         # im_bgr: np.ndarray = cv2.cvtColor(cv2.imread(im_path), cv2.COLOR_BGR2RGB)
-        yolo_res: Results = self.yolo_holds(im_path)[0]
+        yolo_res: Results = self.yolo_holds(im_path, conf=.3)[0]
         out: List[HoldBBox] = []
         # detected_holds = yolo_res.boxes
         for id, box in enumerate(yolo_res.boxes):
@@ -769,11 +816,11 @@ class ChalkGpt:
                     world_frame_with_climber = np.array(world_frame)
                     end_row = world_frame_with_climber.shape[0]
                     if self.H_ext != 0:
-                        end_row = -self.H_ext
+                        end_row = -1#self.H_ext
                     end_col = world_frame_with_climber.shape[1]
                     if self.W_ext != 0:
                         end_col = -self.W_ext
-                    world_frame_with_climber[self.H_ext:end_row,self.W_ext:end_col] = raw_frame
+                    world_frame_with_climber[2*self.H_ext-1:end_row,self.W_ext:end_col] = raw_frame
                     T = self.transform_to_world[out_frame_idx][:2]
                     bbox.apply_transform(T=self.get_world_frame_placement_transform())
                     bbox.apply_transform(T=T)
@@ -793,12 +840,17 @@ class ChalkGpt:
                         # Draw contours on an empty image (optional visualization)
                         contour_image = np.zeros_like(mask, dtype=np.uint8)
                         contour_image = cv2.drawContours(contour_image, contours, -1, 255, 1)
-                        skeleton_world_frame[self.H_ext:end_row,self.W_ext:end_col] = np.tile(np.expand_dims(contour_image,2),[1,1,3])
+                        skeleton_world_frame[2*self.H_ext-1:end_row,self.W_ext:end_col] = np.tile(np.expand_dims(contour_image,2),[1,1,3])
                         skeleton_world_frame = cv2.warpAffine(skeleton_world_frame, T, (skeleton_world_frame.shape[1], skeleton_world_frame.shape[0]), cv2.INTER_LINEAR)
                         # mask_world = cv2.warpAffine(np.tile(np.expand_dims(mask,2),[1,1,3]).astype(np.uint8)*255, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
                         skeleton_world_frame = draw_holds_on_image(skeleton_world_frame, [h for h in self.holds_world if not is_bbox_occluded_by_mask(mask=mask_polygon_world, bbox=h)])
-                        cv2.imshow("skeleton", skeleton_world_frame)
-                    cv2.imshow("original",raw_frame)
+                        skeleton_world_frame = add_clock_to_image(skeleton_world_frame, out_frame_idx, self.config.video_fps)
+                        joint_image = join_images(world_image=skeleton_world_frame,
+                                                  raw_image=raw_frame)
+                        self.video_writer.add_frame(joint_image)
+                        cv2.imshow("joint", joint_image)
+
+                    # cv2.imshow("original",raw_frame)
 
                     if False:
                         pose: ImagePoseEstimationPrediction = self.yolo_pose.predict(climber_crop, conf=0.3, fuse_model=False, batch_size=1)
@@ -893,6 +945,8 @@ if __name__ == "__main__":
                                             detector_threshold=.1,
                                             superglue_model='outdoor',
                                             mask_for_matching=False,
-                                            max_frames=None)
+                                            max_frames=None,
+                                            save_video_path='output',
+                                            video_fps=30)
     chalk_gpt: ChalkGpt = ChalkGpt(config)
     chalk_gpt.main()
