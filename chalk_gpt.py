@@ -516,7 +516,7 @@ def join_images(world_image, raw_image):
     h2, w2 = raw_image.shape[:2]
 
     # Ensure image_1 is taller than image_2
-    if h1 <= h2:
+    if h1 < h2:
         raise ValueError("image_1 must be taller than image_2")
 
     # Calculate padding needed for image_2
@@ -820,7 +820,10 @@ class ChalkGpt:
                     end_col = world_frame_with_climber.shape[1]
                     if self.W_ext != 0:
                         end_col = -self.W_ext
-                    world_frame_with_climber[2*self.H_ext-1:end_row,self.W_ext:end_col] = raw_frame
+                    if self.static_video:
+                        world_frame_with_climber[2 * self.H_ext:end_row, self.W_ext:end_col] = raw_frame
+                    else:
+                        world_frame_with_climber[2*self.H_ext-1:end_row,self.W_ext:end_col] = raw_frame
                     T = self.transform_to_world[out_frame_idx][:2]
                     bbox.apply_transform(T=self.get_world_frame_placement_transform())
                     bbox.apply_transform(T=T)
@@ -840,7 +843,10 @@ class ChalkGpt:
                         # Draw contours on an empty image (optional visualization)
                         contour_image = np.zeros_like(mask, dtype=np.uint8)
                         contour_image = cv2.drawContours(contour_image, contours, -1, 255, 1)
-                        skeleton_world_frame[2*self.H_ext-1:end_row,self.W_ext:end_col] = np.tile(np.expand_dims(contour_image,2),[1,1,3])
+                        if self.static_video:
+                            skeleton_world_frame[2 * self.H_ext:end_row, self.W_ext:end_col] = np.tile(np.expand_dims(contour_image, 2), [1, 1, 3])
+                        else:
+                            skeleton_world_frame[2*self.H_ext-1:end_row,self.W_ext:end_col] = np.tile(np.expand_dims(contour_image,2),[1,1,3])
                         skeleton_world_frame = cv2.warpAffine(skeleton_world_frame, T, (skeleton_world_frame.shape[1], skeleton_world_frame.shape[0]), cv2.INTER_LINEAR)
                         # mask_world = cv2.warpAffine(np.tile(np.expand_dims(mask,2),[1,1,3]).astype(np.uint8)*255, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
                         skeleton_world_frame = draw_holds_on_image(skeleton_world_frame, [h for h in self.holds_world if not is_bbox_occluded_by_mask(mask=mask_polygon_world, bbox=h)])
@@ -938,7 +944,7 @@ class ChalkGpt:
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
                                             try_to_load_from_disk=True,
-                                            images_dir='downloaded_frames_tag',
+                                            images_dir='fat_guy',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
                                             matcher_threshold=.9,
