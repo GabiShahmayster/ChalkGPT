@@ -22,6 +22,7 @@ from ultralytics.engine.results import Results
 from mouse_click import select_pixel
 from sam2.build_sam import build_sam2_video_predictor
 from src.base import KeypointData, KeypointMatchingResults
+from src.holds_clustering import cluster_images, visualize_clusters
 from src.superglue import SuperGlue
 from src.superpoint import SuperPoint
 from src.video_writer import VideoWriterChalkGpt, add_clock_to_image
@@ -122,8 +123,20 @@ class BoundingBox:
         xyxy: Tuple[float] = tuple([int(i) for i in ultralytics_bbox.xyxy.cpu().numpy().squeeze()])
         return BoundingBox(top_left=xyxy[:2],bottom_right=xyxy[2:])
 
-    def get_image_crop(self, im: np.ndarray) -> np.ndarray:
-        return im[self.top_left[1]:self.bottom_right[1],self.top_left[0]:self.bottom_right[0]]
+    def get_image_crop(self, im: np.ndarray, buffer: int = 0) -> np.ndarray:
+        tl_y = self.top_left[1] - buffer
+        tl_x = self.top_left[0] - buffer
+        br_y = self.bottom_right[1] + buffer
+        br_x = self.bottom_right[0] + buffer
+        if tl_y < 0:
+            tl_y = self.top_left[1]
+        if tl_x < 0:
+            tl_x = self.top_left[0]
+        if br_y >= im.shape[0]:
+            br_y = self.bottom_right[1]
+        if br_x >= im.shape[1]:
+            br_x = self.bottom_right[0]
+        return im[tl_y:br_y,tl_x:br_x]
 
     def draw_on_image(self,
             im: np.ndarray,
@@ -211,7 +224,7 @@ class HoldBBox(BoundingBox):
     is_near_climber: bool = False
     is_labeled: bool = False
     UNABELED_ID:int = -1
-
+    image: np.ndarray = None
     def __init__(self, top_left: tuple, bottom_right: tuple, id: int = None,
                  embedding: torch.Tensor = None, width_px: int = None, height_px: int = None,
                  is_near_climber: bool = False, is_labeled: bool = False):
@@ -618,6 +631,7 @@ class ChalkGpt:
             self.describe_video()
             self.label_all_holds()
             self.match_holds()
+            self.get_holds_color()
             self.visualize(video_segments=video_segments, frame_names=frame_names)
         if self.video_writer is not None:
             self.video_writer.release()
@@ -930,13 +944,26 @@ class ChalkGpt:
         holds_world_positions = np.array([h.get_center() for h in self.holds_world])
         T_init_world = self.get_world_frame_placement_transform(return_homogeneous=True)
         for curr_frame_id, frame_data in self.frames_data.items():
+            frame_image = frame_data.get_image()
             holds_in_frame = get_holds_centers(frame_data.holds, return_homogeneous=True)
             holds_in_frame_world = self.transform_to_world[curr_frame_id] @ T_init_world @ holds_in_frame
             kdtree = cKDTree(holds_in_frame_world[:2].T)
             distances, indices = kdtree.query(holds_world_positions, k=1)
-            for world_idx, hold_idx in enumerate(indices):
+            for world_idx, (dist, hold_idx) in enumerate(zip(distances, indices)):
                 frame_data.holds[hold_idx].id = self.holds_world[world_idx].id
                 frame_data.holds[hold_idx].is_labeled = True
+                if self.holds_world[world_idx].image is None and dist<self.config.hold_to_traj_association_distance_px:
+                    self.holds_world[world_idx].image = frame_data.holds[hold_idx].get_image_crop(frame_image)
+
+    def get_holds_color(self):
+        images = [h.image for h in self.holds_world if h.image is not None]
+        temp = []
+        for im in images:
+            _, mask = cv2.threshold(cv2.cvtColor(im, cv2.COLOR_BGR2GRAY), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            mask = ~mask.astype(bool)
+            temp.append(im * np.tile(np.expand_dims(mask,2),[1,1,3]))
+        clusters, labels, centers, n_centers = cluster_images(temp)
+        visualize_clusters(temp, clusters)
 
 
 # TODO - holds occlusion should be handled using climber polygon
