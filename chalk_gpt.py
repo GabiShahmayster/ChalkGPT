@@ -29,6 +29,8 @@ from src.video_writer import VideoWriterChalkGpt, add_clock_to_image
 from vector_db import FAISSIndex
 from video_extractor import extract_video_frames
 from shapely.geometry import Polygon, MultiPolygon
+from transformers import CLIPProcessor, CLIPModel
+from PIL import Image
 
 from shapely.geometry import Polygon
 import shapely.affinity as affinity
@@ -225,6 +227,8 @@ class HoldBBox(BoundingBox):
     is_labeled: bool = False
     UNABELED_ID:int = -1
     image: np.ndarray = None
+    color_name: str = None
+    bgr_color: Tuple[int, int, int] = None
     def __init__(self, top_left: tuple, bottom_right: tuple, id: int = None,
                  embedding: torch.Tensor = None, width_px: int = None, height_px: int = None,
                  is_near_climber: bool = False, is_labeled: bool = False):
@@ -252,7 +256,7 @@ class HoldBBox(BoundingBox):
         cls.global_uid += 1
         return cls.global_uid
 
-    def draw_on_image(self,color: Tuple[int]=(0,0,0),text_color: Tuple[int]=(255,255,255),**kwargs):
+    def draw_on_image(self,color: Tuple[int, int, int]=(0,0,0),text_color: Tuple[int]=(255,255,255),**kwargs):
         if kwargs.get('label') is None:
             kwargs['label'] = '' if self.id is None else f"{self.id}"
         return BoundingBox.draw_on_image(self, color=color, text_color=text_color, **kwargs)
@@ -273,7 +277,7 @@ def get_holds_centers(holds: List[HoldBBox], return_homogeneous: bool = False) -
 def draw_holds_on_image(im: np.ndarray, holds: List[HoldBBox] = None, color: Tuple[int] = (128, 128, 128),text_color: Tuple[int]=(255,255,255)):
     out = np.array(im)
     for h in holds:
-        out = h.draw_on_image(im=out, color=color, text_color=text_color)
+        out = h.draw_on_image(im=out, color=h.bgr_color, text_color=text_color)
     return out
 
 def show_mask(mask, ax, obj_id=None, random_color=False):
@@ -956,14 +960,86 @@ class ChalkGpt:
                     self.holds_world[world_idx].image = frame_data.holds[hold_idx].get_image_crop(frame_image)
 
     def get_holds_color(self):
-        temp = [h.image for h in self.holds_world if h.image is not None]
-        # temp = []
-        # for im in images:
-        #     # _, mask = cv2.threshold(cv2.cvtColor(im, cv2.COLOR_BGR2GRAY), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        #     # mask = ~mask.astype(bool)
-        #     temp.append(im * np.tile(np.expand_dims(mask,2),[1,1,3]))
-        clusters, labels, centers, n_centers = cluster_images(temp)
-        # visualize_clusters(temp, clusters)
+        """
+        Classify hold colors using CLIP zero-shot classification.
+        Assigns human-readable color names and BGR color tuples to each hold.
+        Uses GPU and batch processing for maximum speed.
+        """
+        print("Loading CLIP model for hold color classification...")
+        clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", use_safetensors=True)
+        clip_model = clip_model.to(self.config.device)
+        clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        print(f"✓ Model loaded on {self.config.device}")
+
+        # Define common climbing hold colors
+        color_labels = [
+            "red climbing hold",
+            "blue climbing hold",
+            "green climbing hold",
+            "yellow climbing hold",
+            "orange climbing hold",
+            "purple climbing hold",
+            "black climbing hold",
+            "white climbing hold",
+            "pink climbing hold",
+            "gray climbing hold"
+        ]
+
+        # Map color names to BGR tuples for visualization
+        color_to_bgr = {
+            "red": (0, 0, 255),
+            "blue": (255, 0, 0),
+            "green": (0, 255, 0),
+            "yellow": (0, 255, 255),
+            "orange": (0, 165, 255),
+            "purple": (255, 0, 255),
+            "black": (0, 0, 0),
+            "white": (255, 255, 255),
+            "pink": (203, 192, 255),
+            "gray": (128, 128, 128)
+        }
+
+        # Collect all holds with images
+        hold_images_pil = []
+        valid_holds = []
+        for hold in self.holds_world:
+            if hold.image is not None:
+                # Convert BGR (OpenCV) to RGB (PIL)
+                hold_image_rgb = cv2.cvtColor(hold.image, cv2.COLOR_BGR2RGB)
+                hold_image_pil = Image.fromarray(hold_image_rgb)
+                hold_images_pil.append(hold_image_pil)
+                valid_holds.append(hold)
+
+        if len(hold_images_pil) == 0:
+            print("No holds with images to classify.")
+            return
+
+        print(f"Classifying {len(hold_images_pil)} holds in batch...")
+
+        # Batch process all holds at once
+        inputs = clip_processor(
+            text=color_labels,
+            images=hold_images_pil,  # Process all images together
+            return_tensors="pt",
+            padding=True
+        )
+
+        # Move inputs to GPU
+        inputs = {k: v.to(self.config.device) for k, v in inputs.items()}
+
+        # Run inference on all holds at once
+        with torch.no_grad():
+            outputs = clip_model(**inputs)
+            logits_per_image = outputs.logits_per_image  # Shape: (num_holds, num_colors)
+            color_indices = logits_per_image.argmax(dim=1)  # Shape: (num_holds,)
+
+        # Assign predicted colors to holds
+        for hold, color_idx in zip(valid_holds, color_indices):
+            predicted_color = color_labels[color_idx.item()].replace(" climbing hold", "")
+            hold.color_name = predicted_color
+            hold.bgr_color = color_to_bgr[predicted_color]
+
+        print(f"✓ Hold color classification complete! Classified {len(valid_holds)} holds.")
 
 
 # TODO - holds occlusion should be handled using climber polygon
