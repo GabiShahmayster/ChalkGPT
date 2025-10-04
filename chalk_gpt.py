@@ -16,7 +16,7 @@ from img2vec_pytorch import Img2Vec
 from matplotlib import pyplot as plt
 from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
-from super_gradients.training.utils.predict import ImagePoseEstimationPrediction
+from super_gradients.training.utils.predict import ImagePoseEstimationPrediction, PoseEstimationPrediction
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from mouse_click import select_pixel
@@ -224,6 +224,7 @@ class HoldBBox(BoundingBox):
     embedding: torch.Tensor
     global_uid: int = -1
     is_near_climber: bool = False
+    is_climbed_route: bool = False
     is_labeled: bool = False
     UNABELED_ID:int = -1
     image: np.ndarray = None
@@ -636,6 +637,7 @@ class ChalkGpt:
             self.label_all_holds()
             self.match_holds()
             self.get_holds_color()
+            self.identify_route_colors()
             self.visualize(video_segments=video_segments, frame_names=frame_names)
         if self.video_writer is not None:
             self.video_writer.release()
@@ -744,10 +746,59 @@ class ChalkGpt:
         for frame_id, frame_data in tqdm.tqdm(self.frames_data.items(), total=len(self.frames_data)):
             frame_data.holds = self.detect_holds(frame_id=frame_id,im_path=frame_data.im_path)
 
-    def find_holds_near_climber(self, mask_polygon: Polygon, holds: List[HoldBBox]):
+    def find_holds_near_climber(self, mask_polygon: Polygon, holds: List[HoldBBox], pose: PoseEstimationPrediction):
+        """
+        Find holds touched by climber's hands and feet using pose estimation keypoints.
+
+        When pose is available: Sets is_climbed_route=True for holds near hands/feet
+        When pose is None: Sets is_near_climber=True as fallback (not used for route)
+
+        COCO keypoint indices:
+        - 9: left_wrist, 10: right_wrist (hands)
+        - 15: left_ankle, 16: right_ankle (feet)
+        """
+        if pose is None or len(pose.poses) == 0:
+            # Fallback to polygon-based detection (used when pose not available)
+            # Only sets is_near_climber, NOT is_climbed_route
+            for hold in holds:
+                if distance_bbox_from_mask(mask_polygon, hold) < self.config.hold_to_traj_association_distance_px:
+                    hold.is_near_climber = True
+            return
+
+        # Get the first (most confident) pose
+        keypoints = pose.poses[0]
+
+        # Extract hand and foot contact points (COCO format)
+        # Indices: 9=left_wrist, 10=right_wrist, 15=left_ankle, 16=right_ankle
+        contact_point_indices = [9, 10, 15, 16]
+        confidence_threshold = 0.3  # Minimum confidence to consider a keypoint
+
+        contact_points = []
+        for idx in contact_point_indices:
+            if idx < len(keypoints):
+                x, y, conf = keypoints[idx]
+                if conf > confidence_threshold:
+                    contact_points.append(np.array([x, y]))
+
+        if len(contact_points) == 0:
+            # No confident keypoints found, fallback to polygon-based
+            for hold in holds:
+                if distance_bbox_from_mask(mask_polygon, hold) < self.config.hold_to_traj_association_distance_px:
+                    hold.is_near_climber = True
+            return
+
+        # Check each hold against hand/foot contact points (pose-based detection)
+        # This is the high-confidence route detection
         for hold in holds:
-            if distance_bbox_from_mask(mask_polygon, hold) < self.config.hold_to_traj_association_distance_px:
-                hold.is_near_climber = True
+            hold_center = hold.get_center()
+
+            for contact_point in contact_points:
+                distance = np.linalg.norm(hold_center - contact_point)
+
+                if distance < self.config.hold_to_traj_association_distance_px:
+                    hold.is_climbed_route = True  # High confidence: pose-based detection
+                    hold.is_near_climber = True   # Also mark as near climber
+                    break  # No need to check other contact points for this hold
 
     def process_frames(self, frame_names):
         inference_state = self.predictor.init_state(video_path=self.config.images_dir, offload_video_to_cpu=True,
@@ -755,6 +806,14 @@ class ChalkGpt:
         self.manually_select_object(inference_state, tracked_obj=TrackedObjectType.Climber, frame_idx=0,
                                     frame_names=frame_names)
         self.find_holds_all_frames(frame_names)
+
+        # Determine which frames to run pose estimation on (target ~10 frames)
+        num_frames = len(frame_names) if self.config.max_frames is None else min(self.config.max_frames, len(frame_names))
+        num_pose_samples = min(10, num_frames)  # Sample at most 10 frames
+        pose_frame_indices = set(np.linspace(0, num_frames - 1, num_pose_samples, dtype=int))
+
+        print(f"Running pose estimation on {num_pose_samples} frames: {sorted(pose_frame_indices)}")
+
         video_segments = {}
         for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(inference_state):
             if self.config.max_frames is not None and out_frame_idx >= self.config.max_frames:
@@ -763,8 +822,16 @@ class ChalkGpt:
             for out_obj_id, mask in video_segments[out_frame_idx].items():
                 mask = mask.squeeze()
                 mask_polygon = mask_to_polygon(mask)
+
+                # Only run pose estimation on sampled frames
+                pose = None
+                if out_frame_idx in pose_frame_indices:
+                    pose = self.yolo_pose.predict(np.tile(np.expand_dims(mask, 2), [1, 1, 3]) * self.frames_data[out_frame_idx].get_image()).prediction
+
                 if out_obj_id == self.CLIMBER_OBJECT_ID:
-                    self.find_holds_near_climber(mask_polygon, self.frames_data[out_frame_idx].holds)
+                    self.find_holds_near_climber(mask_polygon=mask_polygon,
+                                                 holds=self.frames_data[out_frame_idx].holds,
+                                                 pose=pose)
         return video_segments
 
     def define_world_frame(self):
@@ -867,7 +934,11 @@ class ChalkGpt:
                             skeleton_world_frame[2*self.H_ext-1:end_row,self.W_ext:end_col] = np.tile(np.expand_dims(contour_image,2),[1,1,3])
                         skeleton_world_frame = cv2.warpAffine(skeleton_world_frame, T, (skeleton_world_frame.shape[1], skeleton_world_frame.shape[0]), cv2.INTER_LINEAR)
                         # mask_world = cv2.warpAffine(np.tile(np.expand_dims(mask,2),[1,1,3]).astype(np.uint8)*255, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
-                        skeleton_world_frame = draw_holds_on_image(skeleton_world_frame, [h for h in self.holds_world if not is_bbox_occluded_by_mask(mask=mask_polygon_world, bbox=h)])
+                        # Filter to only show climbed route holds (pose-based detection) and not occluded by climber
+                        route_holds = [h for h in self.holds_world
+                                      if h.is_climbed_route
+                                      and not is_bbox_occluded_by_mask(mask=mask_polygon_world, bbox=h)]
+                        skeleton_world_frame = draw_holds_on_image(skeleton_world_frame, route_holds)
                         skeleton_world_frame = add_clock_to_image(skeleton_world_frame, out_frame_idx, self.config.video_fps)
                         joint_image = join_images(world_image=skeleton_world_frame,
                                                   raw_image=raw_frame)
@@ -1041,12 +1112,38 @@ class ChalkGpt:
 
         print(f"✓ Hold color classification complete! Classified {len(valid_holds)} holds.")
 
+    def identify_route_colors(self):
+        """
+        Identify the colors of holds touched by the climber using pose-based detection.
+        These colors represent the route being climbed.
+        Marks world holds as is_climbed_route=True if they were touched.
+        """
+        touched_hold_ids = set()
+
+        # Collect IDs of all holds marked as climbed route (pose-based detection)
+        for frame_id, frame_data in self.frames_data.items():
+            for hold in frame_data.holds:
+                if hold.is_climbed_route and hold.id is not None:
+                    touched_hold_ids.add(hold.id)
+
+        # Mark corresponding world holds as part of climbed route and collect colors
+        route_colors = set()
+        for hold in self.holds_world:
+            if hold.id in touched_hold_ids:
+                hold.is_climbed_route = True  # Mark world hold as part of route
+                if hold.color_name is not None:
+                    route_colors.add(hold.color_name)
+
+        self.route_colors = route_colors
+        print(f"✓ Identified route colors (pose-based): {sorted(route_colors)}")
+        print(f"  Route uses {len(route_colors)} color(s) from {len(touched_hold_ids)} touched holds")
+
 
 # TODO - holds occlusion should be handled using climber polygon
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
-                                            try_to_load_from_disk=True,
+                                            try_to_load_from_disk=False,
                                             images_dir='anna',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
