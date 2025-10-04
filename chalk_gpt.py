@@ -956,14 +956,14 @@ class ChalkGpt:
                     self.holds_world[world_idx].image = frame_data.holds[hold_idx].get_image_crop(frame_image)
 
     def get_holds_color(self):
-        images = [h.image for h in self.holds_world if h.image is not None]
-        temp = []
-        for im in images:
-            _, mask = cv2.threshold(cv2.cvtColor(im, cv2.COLOR_BGR2GRAY), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            mask = ~mask.astype(bool)
-            temp.append(im * np.tile(np.expand_dims(mask,2),[1,1,3]))
+        temp = [h.image for h in self.holds_world if h.image is not None]
+        # temp = []
+        # for im in images:
+        #     # _, mask = cv2.threshold(cv2.cvtColor(im, cv2.COLOR_BGR2GRAY), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        #     # mask = ~mask.astype(bool)
+        #     temp.append(im * np.tile(np.expand_dims(mask,2),[1,1,3]))
         clusters, labels, centers, n_centers = cluster_images(temp)
-        visualize_clusters(temp, clusters)
+        # visualize_clusters(temp, clusters)
 
 
 # TODO - holds occlusion should be handled using climber polygon
@@ -971,7 +971,7 @@ class ChalkGpt:
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
                                             try_to_load_from_disk=True,
-                                            images_dir='fat_guy',
+                                            images_dir='anna',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
                                             matcher_threshold=.9,
