@@ -9,14 +9,12 @@ import random
 import string
 import cv2
 import numpy as np
-import super_gradients
 import torch
 import tqdm
 from img2vec_pytorch import Img2Vec
 from matplotlib import pyplot as plt
 from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
-from super_gradients.training.utils.predict import ImagePoseEstimationPrediction, PoseEstimationPrediction
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from mouse_click import select_pixel
@@ -558,7 +556,6 @@ class ChalkGpt:
     config: ChalkGptConfig
     predictor: object
     pose_estimator: object
-    yolo_pose: object
     yolo_holds: object
     # vector_db: FAISSIndex
     random_labels_generator: RandomLabelsGenerator
@@ -580,8 +577,10 @@ class ChalkGpt:
         model_cfg = "sam2_hiera_s.yaml"
         self.predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
 
-        self.yolo_pose = super_gradients.training.models.get("yolo_nas_pose_l", pretrained_weights="coco_pose").cuda()
-        self.yolo_pose.eval()
+        # Initialize Ultralytics YOLO Pose model (yolov8m-pose for balanced speed/accuracy)
+        # Other options: yolov8n-pose.pt (fastest), yolov8s-pose.pt, yolov8l-pose.pt (most accurate)
+        # Or YOLOv11: yolo11m-pose.pt
+        self.pose_estimator = YOLO("yolov8m-pose.pt")
 
         self.img2vec = Img2Vec(cuda=config.device is torch.device('cuda:0'), model='resnet-18')
         # self.vector_db = FAISSIndex(dimension=512, index_type='cosine')
@@ -637,7 +636,7 @@ class ChalkGpt:
             self.label_all_holds()
             self.match_holds()
             self.get_holds_color()
-            self.identify_route_colors()
+            self.identify_route_color()
             self.visualize(video_segments=video_segments, frame_names=frame_names)
         if self.video_writer is not None:
             self.video_writer.release()
@@ -746,7 +745,40 @@ class ChalkGpt:
         for frame_id, frame_data in tqdm.tqdm(self.frames_data.items(), total=len(self.frames_data)):
             frame_data.holds = self.detect_holds(frame_id=frame_id,im_path=frame_data.im_path)
 
-    def find_holds_near_climber(self, mask_polygon: Polygon, holds: List[HoldBBox], pose: PoseEstimationPrediction):
+    def _convert_yolo_pose_output(self, results):
+        """
+        Convert Ultralytics YOLO Pose output to format compatible with find_holds_near_climber.
+
+        YOLO Pose returns: Results object with:
+        - keypoints.xy: (N, 17, 2) - x, y coordinates
+        - keypoints.conf: (N, 17) - confidence scores
+
+        Returns: SimpleNamespace with:
+        - poses: list of (17, 3) arrays with [x, y, conf]
+        """
+        from types import SimpleNamespace
+
+        if results is None or len(results) == 0 or results[0].keypoints is None:
+            return SimpleNamespace(poses=[])
+
+        result = results[0]
+        keypoints = result.keypoints
+
+        if keypoints.xy is None or len(keypoints.xy) == 0:
+            return SimpleNamespace(poses=[])
+
+        # Combine keypoints and confidence scores
+        poses = []
+        for i in range(len(keypoints.xy)):
+            kpts_xy = keypoints.xy[i].cpu().numpy()  # (17, 2)
+            kpts_conf = keypoints.conf[i].cpu().numpy()  # (17,)
+            # Combine to (17, 3) format: [x, y, conf]
+            pose = np.concatenate([kpts_xy, kpts_conf[:, np.newaxis]], axis=1)
+            poses.append(pose)
+
+        return SimpleNamespace(poses=poses)
+
+    def find_holds_near_climber(self, image: np.ndarray, mask_polygon: Polygon, holds: List[HoldBBox], pose):
         """
         Find holds touched by climber's hands and feet using pose estimation keypoints.
 
@@ -767,10 +799,11 @@ class ChalkGpt:
 
         # Get the first (most confident) pose
         keypoints = pose.poses[0]
-
         # Extract hand and foot contact points (COCO format)
-        # Indices: 9=left_wrist, 10=right_wrist, 15=left_ankle, 16=right_ankle
-        contact_point_indices = [9, 10, 15, 16]
+        # https: // docs.ultralytics.com / tasks / pose /
+        # COCO keypoint indices:
+        # 9=left_wrist, 10=right_wrist, 15=left_ankle, 16=right_ankle
+        contact_point_indices = [9, 10, 15, 16]#, 15, 16]
         confidence_threshold = 0.3  # Minimum confidence to consider a keypoint
 
         contact_points = []
@@ -789,16 +822,14 @@ class ChalkGpt:
 
         # Check each hold against hand/foot contact points (pose-based detection)
         # This is the high-confidence route detection
-        for hold in holds:
-            hold_center = hold.get_center()
-
-            for contact_point in contact_points:
+        for contact_point in contact_points:
+            for hold in holds:
+                hold_center = hold.get_center()
                 distance = np.linalg.norm(hold_center - contact_point)
-
-                if distance < self.config.hold_to_traj_association_distance_px:
+                if distance < 3*self.config.hold_to_traj_association_distance_px:
                     hold.is_climbed_route = True  # High confidence: pose-based detection
                     hold.is_near_climber = True   # Also mark as near climber
-                    break  # No need to check other contact points for this hold
+                    break  # No need to check other holds
 
     def process_frames(self, frame_names):
         inference_state = self.predictor.init_state(video_path=self.config.images_dir, offload_video_to_cpu=True,
@@ -826,10 +857,15 @@ class ChalkGpt:
                 # Only run pose estimation on sampled frames
                 pose = None
                 if out_frame_idx in pose_frame_indices:
-                    pose = self.yolo_pose.predict(np.tile(np.expand_dims(mask, 2), [1, 1, 3]) * self.frames_data[out_frame_idx].get_image()).prediction
-
+                    # Apply climber mask to image
+                    masked_image = np.tile(np.expand_dims(mask, 2), [1, 1, 3]) * self.frames_data[out_frame_idx].get_image()
+                    # Run YOLO Pose inference
+                    pose_results = self.pose_estimator(masked_image, conf=0.3, verbose=False)
+                    # Convert to compatible format
+                    pose = self._convert_yolo_pose_output(pose_results)
                 if out_obj_id == self.CLIMBER_OBJECT_ID:
-                    self.find_holds_near_climber(mask_polygon=mask_polygon,
+                    self.find_holds_near_climber(image=self.frames_data[out_frame_idx].get_image(),
+                                                 mask_polygon=mask_polygon,
                                                  holds=self.frames_data[out_frame_idx].holds,
                                                  pose=pose)
         return video_segments
@@ -936,8 +972,8 @@ class ChalkGpt:
                         # mask_world = cv2.warpAffine(np.tile(np.expand_dims(mask,2),[1,1,3]).astype(np.uint8)*255, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
                         # Filter to only show climbed route holds (pose-based detection) and not occluded by climber
                         route_holds = [h for h in self.holds_world
-                                      if h.is_climbed_route
-                                      and not is_bbox_occluded_by_mask(mask=mask_polygon_world, bbox=h)]
+                                      if not is_bbox_occluded_by_mask(mask=mask_polygon_world, bbox=h)
+                                       and h.color_name == self.route_color]
                         skeleton_world_frame = draw_holds_on_image(skeleton_world_frame, route_holds)
                         skeleton_world_frame = add_clock_to_image(skeleton_world_frame, out_frame_idx, self.config.video_fps)
                         joint_image = join_images(world_image=skeleton_world_frame,
@@ -947,13 +983,8 @@ class ChalkGpt:
 
                     # cv2.imshow("original",raw_frame)
 
-                    if False:
-                        pose: ImagePoseEstimationPrediction = self.yolo_pose.predict(climber_crop, conf=0.3, fuse_model=False, batch_size=1)
-                        pose_draw = pose.draw()
-                        cv2.imshow("climber pose", pose_draw)
-                        mask_3d = np.stack((0 * mask, 0 * mask, mask), axis=2).astype(np.uint8)
-                        blended_frame = cv2.blendLinear(blended_frame, 255 * mask_3d, 0.5 * np.ones_like(mask, dtype=np.float32),
-                                                0.5 * np.ones_like(mask, dtype=np.float32))
+                    # Note: Pose visualization code removed during pose estimation migration
+                    # Can be re-added using YOLO Pose results.plot() if needed
             if False:
                 cv2.imshow("blended frame", blended_frame)
 
@@ -1112,7 +1143,7 @@ class ChalkGpt:
 
         print(f"✓ Hold color classification complete! Classified {len(valid_holds)} holds.")
 
-    def identify_route_colors(self):
+    def identify_route_color(self):
         """
         Identify the colors of holds touched by the climber using pose-based detection.
         These colors represent the route being climbed.
@@ -1127,16 +1158,19 @@ class ChalkGpt:
                     touched_hold_ids.add(hold.id)
 
         # Mark corresponding world holds as part of climbed route and collect colors
-        route_colors = set()
+        route_colors = {}
         for hold in self.holds_world:
             if hold.id in touched_hold_ids:
                 hold.is_climbed_route = True  # Mark world hold as part of route
                 if hold.color_name is not None:
-                    route_colors.add(hold.color_name)
+                    if route_colors.get(hold.color_name) is None:
+                        route_colors[hold.color_name] = 0
+                    route_colors[hold.color_name] += 1
 
-        self.route_colors = route_colors
-        print(f"✓ Identified route colors (pose-based): {sorted(route_colors)}")
-        print(f"  Route uses {len(route_colors)} color(s) from {len(touched_hold_ids)} touched holds")
+        colors = list(route_colors.keys())
+        nb_appearances = np.array(list(route_colors.values()))
+        self.route_color = colors[np.argmax(nb_appearances)]
+        print(f"✓ Identified route color (pose-based): {self.route_color}")
 
 
 # TODO - holds occlusion should be handled using climber polygon
@@ -1144,7 +1178,7 @@ class ChalkGpt:
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
                                             try_to_load_from_disk=False,
-                                            images_dir='anna',
+                                            images_dir='downloaded_frames_tag2',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
                                             matcher_threshold=.9,
