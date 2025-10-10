@@ -18,7 +18,6 @@ from sklearn.cluster import DBSCAN
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from mouse_click import select_pixel
-from sam2.build_sam import build_sam2_video_predictor
 from src.base import KeypointData, KeypointMatchingResults
 from src.holds_clustering import cluster_images, visualize_clusters
 from src.superglue import SuperGlue
@@ -573,16 +572,18 @@ class ChalkGpt:
     def   __init__(self, config: ChalkGptConfig):
         self.config = config
 
-        sam2_checkpoint = "checkpoints/sam2_hiera_small.pt"
-        model_cfg = "sam2_hiera_s.yaml"
-        self.predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
+        # Load SAM2 from HuggingFace (auto-downloads and caches model)
+        # Options: facebook/sam2-hiera-tiny, facebook/sam2-hiera-small,
+        #          facebook/sam2-hiera-base-plus, facebook/sam2-hiera-large
+        from sam2.sam2_video_predictor import SAM2VideoPredictor
+        self.predictor = SAM2VideoPredictor.from_pretrained("facebook/sam2-hiera-small")
 
         # Initialize Ultralytics YOLO Pose model (yolov8m-pose for balanced speed/accuracy)
         # Other options: yolov8n-pose.pt (fastest), yolov8s-pose.pt, yolov8l-pose.pt (most accurate)
         # Or YOLOv11: yolo11m-pose.pt
         self.pose_estimator = YOLO("yolov8m-pose.pt")
 
-        self.img2vec = Img2Vec(cuda=config.device is torch.device('cuda:0'), model='resnet-18')
+        # self.img2vec = Img2Vec(cuda=config.device is torch.device('cuda:0'), model='resnet-18')
         # self.vector_db = FAISSIndex(dimension=512, index_type='cosine')
 
         self.yolo_holds = YOLO("weights/holds/v1/weights/best.pt")
@@ -618,19 +619,23 @@ class ChalkGpt:
                     frame_names = saved_data['frame_names']
                     video_segments = saved_data['video_segments']
                     self.frames_data = saved_data['frames_data']
+                    self.relative_motion = saved_data['relative_motion']
+                    self.transform_to_world = saved_data['transform_to_world']
                     process_frames = False
 
             if process_frames:
                 frame_names = self.init_frames()
                 video_segments = self.process_frames(frame_names=frame_names)
+                self.estimate_relative_motion(video_segments=video_segments, frame_names=frame_names)
                 save_data: Dict = {"frame_names":frame_names,
                                    "video_segments":video_segments,
-                                   "frames_data": self.frames_data}
+                                   "frames_data": self.frames_data,
+                                   "relative_motion": self.relative_motion,
+                                   "transform_to_world": self.transform_to_world}
                 if self.config.save_to_disk:
                     with open(output_path, 'wb') as f:
                         pickle.dump(save_data, f)
 
-            self.estimate_relative_motion(video_segments=video_segments, frame_names=frame_names)
             self.define_world_frame()
             self.describe_video()
             self.label_all_holds()
