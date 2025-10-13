@@ -5,22 +5,9 @@ import cv2
 import os
 import numpy as np
 
-
-def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, force_download: bool = False):
-    # Configure yt-dlp options
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4][height<=720][abr<250]+bestaudio/best[height<=720]',
-        'outtmpl': 'temp_video.%(ext)s'
-    }
-    """
-    youtube-dl --get-title -f 'bestvideo[ext=mp4][height<=640][abr<250]+bestaudio/best[height<=640]' https://www.youtube.com/watch?v=VIDEO_ID --get-title 00:00:10-00:00:20
-    """
-    # Download the video
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-
+def save_video(video_path: str, start_time, num_frames, output_path, resize_factor, fps=30):
     # Open the video file
-    video = cv2.VideoCapture('temp_video.webm')
+    video = cv2.VideoCapture(video_path)
 
     # Set the starting point
     fps = video.get(cv2.CAP_PROP_FPS)
@@ -55,22 +42,42 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, 
     # Clean up
     video.release()
     cv2.destroyAllWindows()
-    try:
-        os.remove('temp_video.webm')
-    except:
-        pass
-    try:
-        os.remove('temp_video.mkv')
-    except:
-        pass
 
+
+def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, force_download: bool = False):
+    # Configure yt-dlp options
+    ydl_opts = {
+        'format': 'bestvideo[ext=mp4][height<=720][abr<250]+bestaudio/best[height<=720]',
+        'outtmpl': 'temp_video.%(ext)s'
+    }
+    """
+    youtube-dl --get-title -f 'bestvideo[ext=mp4][height<=640][abr<250]+bestaudio/best[height<=640]' https://www.youtube.com/watch?v=VIDEO_ID --get-title 00:00:10-00:00:20
+    """
+    # Download the video
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+    video_path = 'temp_video.mp4'
+    save_video(video_path=video_path,
+               output_path=output_dir,
+               resize_factor=resize_factor,
+               start_time=start_time,
+                num_frames=num_frames,
+               fps=30)
+    if os.path.exists('temp_video.mp4'):
+        os.remove('temp_video.mp4')
+    elif os.path.exists('temp_video.webm'):
+        os.remove('temp_video.webm')
+    elif os.path.exists('temp_video.mkv'):
+        os.remove('temp_video.mkv')
+    else:
+        pass
 
 if __name__ == "__main__":
     # Usage
-    url = 'https://www.youtube.com/shorts/qgjTO_5PxJE'
+    url = 'https://youtube.com/shorts/RCNDnQ6kIPc?si=b9YouNhN_vKIrJyC'
     start_time = 0  # 22:27 in seconds
-    num_frames = 300
-    output_dir = 'fat_guy'
+    num_frames =1000
+    output_dir = 'v5_green'
 
     download_frames(url, start_time, num_frames, output_dir, force_download=True, resize_factor=1)
 

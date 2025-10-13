@@ -845,7 +845,7 @@ class ChalkGpt:
 
         # Determine which frames to run pose estimation on (target ~10 frames)
         num_frames = len(frame_names) if self.config.max_frames is None else min(self.config.max_frames, len(frame_names))
-        num_pose_samples = min(10, num_frames)  # Sample at most 10 frames
+        num_pose_samples = min(100, num_frames)  # Sample at most 10 frames
         pose_frame_indices = set(np.linspace(0, num_frames - 1, num_pose_samples, dtype=int))
 
         print(f"Running pose estimation on {num_pose_samples} frames: {sorted(pose_frame_indices)}")
@@ -866,6 +866,7 @@ class ChalkGpt:
                     masked_image = np.tile(np.expand_dims(mask, 2), [1, 1, 3]) * self.frames_data[out_frame_idx].get_image()
                     # Run YOLO Pose inference
                     pose_results = self.pose_estimator(masked_image, conf=0.3, verbose=False)
+                    self.frames_data[out_frame_idx].pose = pose_results
                     # Convert to compatible format
                     pose = self._convert_yolo_pose_output(pose_results)
                 if out_obj_id == self.CLIMBER_OBJECT_ID:
@@ -969,10 +970,16 @@ class ChalkGpt:
                         # Draw contours on an empty image (optional visualization)
                         contour_image = np.zeros_like(mask, dtype=np.uint8)
                         contour_image = cv2.drawContours(contour_image, contours, -1, 255, 1)
-                        if self.static_video:
-                            skeleton_world_frame[2 * self.H_ext:end_row, self.W_ext:end_col] = np.tile(np.expand_dims(contour_image, 2), [1, 1, 3])
+                        if hasattr(self.frames_data[out_frame_idx], "pose"):
+                            contour_image = self.frames_data[out_frame_idx].pose[0].plot(img=cv2.cvtColor(contour_image, cv2.COLOR_GRAY2BGR),conf=False,labels=False, boxes=False)
+                        if len(contour_image.shape) == 2:
+                            contour_rgb = np.tile(np.expand_dims(contour_image, 2), [1, 1, 3])
                         else:
-                            skeleton_world_frame[2*self.H_ext-1:end_row,self.W_ext:end_col] = np.tile(np.expand_dims(contour_image,2),[1,1,3])
+                            contour_rgb = contour_image
+                        if self.static_video:
+                            skeleton_world_frame[2 * self.H_ext:end_row, self.W_ext:end_col] = contour_rgb
+                        else:
+                            skeleton_world_frame[2*self.H_ext-1:end_row,self.W_ext:end_col] = contour_rgb
                         skeleton_world_frame = cv2.warpAffine(skeleton_world_frame, T, (skeleton_world_frame.shape[1], skeleton_world_frame.shape[0]), cv2.INTER_LINEAR)
                         # mask_world = cv2.warpAffine(np.tile(np.expand_dims(mask,2),[1,1,3]).astype(np.uint8)*255, T, (world_frame_with_climber.shape[1], world_frame_with_climber.shape[0]), cv2.INTER_LINEAR)
                         # Filter to only show climbed route holds (pose-based detection) and not occluded by climber
@@ -1182,8 +1189,8 @@ class ChalkGpt:
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
-                                            try_to_load_from_disk=False,
-                                            images_dir='downloaded_frames_tag2',
+                                            try_to_load_from_disk=True,
+                                            images_dir='fat_guy',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
                                             matcher_threshold=.9,
