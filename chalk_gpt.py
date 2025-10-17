@@ -401,6 +401,7 @@ class FrameData:
     im_path: str
     holds: List[HoldBBox]
     transform_to_world: np.ndarray
+    pose: Results
 
     def __init__(self, id: int, im_path: str):
         self.id = id
@@ -642,6 +643,7 @@ class ChalkGpt:
             self.match_holds()
             self.get_holds_color()
             self.identify_route_color()
+            self.route_color = 'yellow'
             self.visualize(video_segments=video_segments, frame_names=frame_names)
         if self.video_writer is not None:
             self.video_writer.release()
@@ -843,13 +845,6 @@ class ChalkGpt:
                                     frame_names=frame_names)
         self.find_holds_all_frames(frame_names)
 
-        # Determine which frames to run pose estimation on (target ~10 frames)
-        num_frames = len(frame_names) if self.config.max_frames is None else min(self.config.max_frames, len(frame_names))
-        num_pose_samples = min(100, num_frames)  # Sample at most 10 frames
-        pose_frame_indices = set(np.linspace(0, num_frames - 1, num_pose_samples, dtype=int))
-
-        print(f"Running pose estimation on {num_pose_samples} frames: {sorted(pose_frame_indices)}")
-
         video_segments = {}
         for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(inference_state):
             if self.config.max_frames is not None and out_frame_idx >= self.config.max_frames:
@@ -860,15 +855,13 @@ class ChalkGpt:
                 mask_polygon = mask_to_polygon(mask)
 
                 # Only run pose estimation on sampled frames
-                pose = None
-                if out_frame_idx in pose_frame_indices:
-                    # Apply climber mask to image
-                    masked_image = np.tile(np.expand_dims(mask, 2), [1, 1, 3]) * self.frames_data[out_frame_idx].get_image()
-                    # Run YOLO Pose inference
-                    pose_results = self.pose_estimator(masked_image, conf=0.3, verbose=False)
-                    self.frames_data[out_frame_idx].pose = pose_results
-                    # Convert to compatible format
-                    pose = self._convert_yolo_pose_output(pose_results)
+                # Apply climber mask to image
+                masked_image = np.tile(np.expand_dims(mask, 2), [1, 1, 3]) * self.frames_data[out_frame_idx].get_image()
+                # Run YOLO Pose inference
+                pose_results = self.pose_estimator(masked_image, conf=0.3, verbose=False)
+                self.frames_data[out_frame_idx].pose = pose_results
+                # Convert to compatible format
+                pose = self._convert_yolo_pose_output(pose_results)
                 if out_obj_id == self.CLIMBER_OBJECT_ID:
                     self.find_holds_near_climber(image=self.frames_data[out_frame_idx].get_image(),
                                                  mask_polygon=mask_polygon,
@@ -1190,7 +1183,7 @@ class ChalkGpt:
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
                                             try_to_load_from_disk=True,
-                                            images_dir='fat_guy',
+                                            images_dir='anna',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
                                             matcher_threshold=.9,

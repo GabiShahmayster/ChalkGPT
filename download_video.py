@@ -5,7 +5,7 @@ import cv2
 import os
 import numpy as np
 
-def save_video(video_path: str, start_time, num_frames, output_path, resize_factor, fps=30):
+def save_video(video_path: str, start_time, num_frames, output_dir, resize_factor, fps=30):
     # Open the video file
     video = cv2.VideoCapture(video_path)
 
@@ -73,11 +73,19 @@ def download_frames(url, start_time, num_frames, output_dir, resize_factor=5.0, 
         pass
 
 if __name__ == "__main__":
-    # Usage
-    url = 'https://youtube.com/shorts/RCNDnQ6kIPc?si=b9YouNhN_vKIrJyC'
-    start_time = 0  # 22:27 in seconds
-    num_frames =1000
-    output_dir = 'v5_green'
+    video_path = r'/home/gabi/Downloads/m2-res_854p.mp4'
+    save_video(video_path=video_path,
+               output_dir='fat_woman',
+               resize_factor=1,
+               start_time=0,
+               num_frames=500,
+               fps=30)
 
-    download_frames(url, start_time, num_frames, output_dir, force_download=True, resize_factor=1)
+    # Usage
+    # url = 'https://youtube.com/shorts/RCNDnQ6kIPc?si=b9YouNhN_vKIrJyC'
+    # start_time = 0  # 22:27 in seconds
+    # num_frames =1000
+    # output_dir = 'v5_green'
+    #
+    # download_frames(url, start_time, num_frames, output_dir, force_download=True, resize_factor=1)
 
