@@ -4,7 +4,7 @@
 
 ## Demo
 
-https://github.com/user-attachments/assets/05b98c63-f9da-4e31-9a8a-16cba174109e
+[https://github.com/user-attachments/assets/05b98c63-f9da-4e31-9a8a-16cba174109e](https://github.com/user-attachments/assets/be3a498a-a3af-4f7c-9290-02035e5203af)
 
 *ChalkGPT in action: Automatic climbing route detection, climber tracking, and hold identification*
 
