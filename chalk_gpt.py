@@ -552,7 +552,6 @@ class ChalkGpt:
     predictor: object
     pose_estimator: object
     yolo_holds: object
-    # vector_db: FAISSIndex
     random_labels_generator: RandomLabelsGenerator
     static_video: bool
     CLIMBER_OBJECT_ID = 1
