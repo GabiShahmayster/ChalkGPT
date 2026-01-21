@@ -8,3 +8,48 @@ build/*
 _C.*
 outputs/*
 checkpoints/*.pt
+
+# IDE
+.idea/
+
+# Data directories - frame extractions
+anna/
+bldr1/
+bldr2/
+downloaded_frames/
+downloaded_frames_new/
+downloaded_frames_short/
+downloaded_frames_tag/
+downloaded_frames_tag2/
+fat_guy/
+fat_woman/
+geek/
+new_video/
+romi/
+simple_v3/
+v5_green/
+walk/
+assets/video/
+assets/video_short/
+assets/weights/
+
+# Cache and output directories
+cache/
+output/
+runs/
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.weights
+
+# PDFs
+*.pdf

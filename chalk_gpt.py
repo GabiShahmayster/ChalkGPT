@@ -17,7 +17,7 @@ from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
-from mouse_click import select_pixel
+from src.mouse_click import select_pixel
 from src.base import KeypointData, KeypointMatchingResults
 from src.holds_clustering import cluster_images, visualize_clusters
 from src.superglue import SuperGlue
@@ -1182,7 +1182,7 @@ class ChalkGpt:
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
-                                            try_to_load_from_disk=True,
+                                            try_to_load_from_disk=False,
                                             images_dir='anna',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
