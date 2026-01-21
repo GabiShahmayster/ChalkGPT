@@ -4,7 +4,7 @@
 
 ## Demo
 
-<video src="assets/chalk_gpt.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/05b98c63-f9da-4e31-9a8a-16cba174109e
 
 *ChalkGPT in action: Automatic climbing route detection, climber tracking, and hold identification*
 
