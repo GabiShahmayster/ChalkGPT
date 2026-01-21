@@ -39,6 +39,7 @@ output/
 runs/
 
 # Video files
+!assets/chalk_gpt.mp4
 *.mp4
 *.avi
 *.mov

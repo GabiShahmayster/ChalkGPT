@@ -633,7 +633,7 @@ class ChalkGpt:
             self.match_holds()
             self.get_holds_color()
             self.identify_route_color()
-            self.route_color = 'yellow'
+            self.route_color = 'green'
             self.visualize(video_segments=video_segments, frame_names=frame_names)
         if self.video_writer is not None:
             self.video_writer.release()

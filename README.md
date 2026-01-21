@@ -2,6 +2,12 @@
 
 **Computer Vision Pipeline for Bouldering Analysis**
 
+## Demo
+
+<video src="assets/chalk_gpt.mp4" controls width="100%"></video>
+
+*ChalkGPT in action: Automatic climbing route detection, climber tracking, and hold identification*
+
 A computer vision system that automatically detects climbing routes, tracks climbers, and identifies holds using deep learning models including SAM 2, YOLO, and SuperPoint/SuperGlue.
 
 ## Overview
