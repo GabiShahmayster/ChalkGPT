@@ -11,7 +11,6 @@ import cv2
 import numpy as np
 import torch
 import tqdm
-from img2vec_pytorch import Img2Vec
 from matplotlib import pyplot as plt
 from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
@@ -19,17 +18,13 @@ from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from src.mouse_click import select_pixel
 from src.base import KeypointData, KeypointMatchingResults
-from src.holds_clustering import cluster_images, visualize_clusters
 from src.superglue import SuperGlue
 from src.superpoint import SuperPoint
 from src.video_writer import VideoWriterChalkGpt, add_clock_to_image
-from vector_db import FAISSIndex
 from video_extractor import extract_video_frames
 from shapely.geometry import Polygon, MultiPolygon
 from transformers import CLIPProcessor, CLIPModel
 from PIL import Image
-
-from shapely.geometry import Polygon
 import shapely.affinity as affinity
 
 
@@ -583,10 +578,6 @@ class ChalkGpt:
         # Other options: yolov8n-pose.pt (fastest), yolov8s-pose.pt, yolov8l-pose.pt (most accurate)
         # Or YOLOv11: yolo11m-pose.pt
         self.pose_estimator = YOLO("yolov8m-pose.pt")
-
-        # self.img2vec = Img2Vec(cuda=config.device is torch.device('cuda:0'), model='resnet-18')
-        # self.vector_db = FAISSIndex(dimension=512, index_type='cosine')
-
         self.yolo_holds = YOLO("weights/holds/v1/weights/best.pt")
         # self.yolo_shoes = YOLO("weights/shoes/v0/weights/best.pt")
         superpoint_config = {'keypoint_threshold':self.config.detector_threshold}
