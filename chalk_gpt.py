@@ -603,7 +603,9 @@ class ChalkGpt:
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             process_frames: bool = True
             os.makedirs('cache', exist_ok=True)
-            output_path: str = os.path.join('cache', self.config.images_dir + '.pkl')
+            output_path: Path = Path(__file__).parent / 'cache' / (Path(self.config.images_dir).stem + '.pkl')
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
             if self.config.try_to_load_from_disk and os.path.exists(output_path):
                 with open(output_path, 'rb') as f:
                     saved_data = pickle.load(f)
@@ -1172,8 +1174,8 @@ class ChalkGpt:
 
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
-                                            try_to_load_from_disk=False,
-                                            images_dir='anna',
+                                            try_to_load_from_disk=True,
+                                            images_dir='videos/anna',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
                                             matcher_threshold=.9,
