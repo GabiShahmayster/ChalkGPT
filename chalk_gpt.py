@@ -19,7 +19,7 @@ from sklearn.cluster import DBSCAN
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 
-from src.auto_climber_detector import auto_segment_climber_vlm_bbox
+from src.auto_climber_detector import auto_segment_climber_vlm_bbox, get_vlm_model
 from src.mouse_click import select_pixel
 from src.base import KeypointData, KeypointMatchingResults
 from src.superglue import SuperGlue
@@ -842,7 +842,9 @@ class ChalkGpt:
         climber_bbox = None
         if self.config.use_vlm_for_climber:
             frame_path = os.path.join(self.config.images_dir, frame_names[0])
-            climber_bbox = auto_segment_climber_vlm_bbox(frame_path=frame_path, vlm_model_key=self.config.vlm_model_key,
+            vlm_model, processor = get_vlm_model(model_key=self.config.vlm_model_key)
+            climber_bbox = auto_segment_climber_vlm_bbox(vlm_model=vlm_model, processor=processor,
+                                                         frame_path=frame_path, vlm_model_key=self.config.vlm_model_key,
                                                          device=self.config.device)
 
         # Now initialize SAM2 with full VRAM headroom

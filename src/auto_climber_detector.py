@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 import json
 import re
 from pathlib import Path
@@ -8,13 +8,9 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForImageTextToText
 
-def auto_segment_climber_vlm_bbox(frame_path: str, vlm_model_key: str, device: torch.device,
-                                    frames_dir: Optional[str] = None, num_frames: int = 5) -> Optional[np.ndarray]:
-    """
-    Use a local VLM to detect the climber's bounding box from a single frame.
-    The model is loaded, used, and immediately deleted to free VRAM.
-    Returns np.array([x1, y1, x2, y2], dtype=np.float32) on success, None on failure.
-    """
+
+def load_vlm_model(vlm_model_key: str) -> Tuple[AutoModelForImageTextToText, AutoProcessor]:
+    """Load VLM model and processor. Can be called once and reused across multiple detections."""
     MODELS = {
         "qwen": "Qwen/Qwen2-VL-2B-Instruct",
         "qwen3": "Qwen/Qwen3-VL-8B-Instruct",
@@ -27,9 +23,42 @@ def auto_segment_climber_vlm_bbox(frame_path: str, vlm_model_key: str, device: t
     }
     model_id = MODELS.get(vlm_model_key)
     if model_id is None:
-        print(f"[VLM] Unknown vlm_model_key: '{vlm_model_key}'. "
-              f"Valid keys: {list(MODELS.keys())}")
-        return None
+        raise ValueError(f"Unknown vlm_model_key: '{vlm_model_key}'. Valid keys: {list(MODELS.keys())}")
+
+    print(f"[VLM] Loading {model_id}...")
+    processor = AutoProcessor.from_pretrained(model_id)
+    vlm_model = AutoModelForImageTextToText.from_pretrained(
+        model_id,
+        dtype=torch.bfloat16,
+        device_map="auto"
+    )
+    return vlm_model, processor
+
+def auto_segment_climber_vlm_bbox(frame_path: str, vlm_model_key: str, device: torch.device,
+                                    frames_dir: Optional[str] = None, num_frames: int = 5,
+                                    vlm_model: Optional[AutoModelForImageTextToText] = None,
+                                    processor: Optional[AutoProcessor] = None,
+                                    own_model: bool = False) -> Optional[np.ndarray]:
+    """
+    Use a local VLM to detect the climber's bounding box from frame(s).
+
+    Args:
+        frame_path: Path to the primary frame
+        vlm_model_key: Model identifier (e.g., 'qwen', '2.2B')
+        device: Torch device to use
+        frames_dir: Optional directory with multiple frames for temporal context
+        num_frames: Number of frames to sample from frames_dir
+        vlm_model: Optional pre-loaded VLM model (will be reused, not deleted)
+        processor: Optional pre-loaded processor (will be reused, not deleted)
+        own_model: If True and vlm_model/processor provided, they will be deleted after use
+
+    Returns:
+        np.array([x1, y1, x2, y2], dtype=np.float32) on success, None on failure.
+    """
+    # Load model if not provided
+    if vlm_model is None or processor is None:
+        vlm_model, processor = load_vlm_model(vlm_model_key)
+        own_model = True  # We loaded it, so we own it
 
     # Load primary frame to get dimensions
     pil_image = Image.open(frame_path).convert('RGB')
@@ -56,16 +85,9 @@ def auto_segment_climber_vlm_bbox(frame_path: str, vlm_model_key: str, device: t
         "Output ONLY the coordinates."
     )
 
-    print(f"[VLM] Loading {model_id} for automatic climber detection...")
-    processor = AutoProcessor.from_pretrained(model_id)
-    vlm_model = AutoModelForImageTextToText.from_pretrained(
-        model_id,
-        dtype=torch.bfloat16,
-        device_map="auto"
-    )
 
     # Format depends on model - Qwen2-VL uses chat template, SmolVLM2 uses <image> token
-    if "qwen" in model_id.lower():
+    if "qwen" in vlm_model_key.lower():
         # Use Qwen-style chat template with multiple images
         content = []
         for _ in pil_images:
@@ -92,8 +114,10 @@ def auto_segment_climber_vlm_bbox(frame_path: str, vlm_model_key: str, device: t
     if "Assistant:" in generated_text:
         generated_text = generated_text.split("Assistant:")[-1].strip()
 
-    # Free VRAM before returning
-    del vlm_model, processor, inputs, generated_ids
+    # Free VRAM: always delete temporary tensors, only delete model if we loaded it
+    del inputs, generated_ids
+    if own_model:
+        del vlm_model, processor
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
