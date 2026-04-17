@@ -18,6 +18,8 @@ from scipy.spatial import cKDTree
 from sklearn.cluster import DBSCAN
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
+
+from src.auto_climber_detector import auto_segment_climber_vlm_bbox
 from src.mouse_click import select_pixel
 from src.base import KeypointData, KeypointMatchingResults
 from src.superglue import SuperGlue
@@ -338,7 +340,7 @@ class ChalkGptConfig:
     save_video_path: str = None
     video_fps: int = 30
     use_vlm_for_climber: bool = True
-    vlm_model_key: str = "qwen3"           # maps to Qwen/Qwen2-VL-2B-Instruct
+    vlm_model_key: str = "2.2B"            # SmolVLM2-2.2B-Instruct, fits on 12 GB VRAM
     vlm_fallback_to_manual: bool = True   # if VLM fails, open CV window instead of raising
 
     def __post_init__(self):
@@ -836,14 +838,26 @@ class ChalkGpt:
                     break  # No need to check other holds
 
     def process_frames(self, frame_names):
+        # Detect climber bbox with VLM *before* SAM2 init to avoid VRAM pressure
+        climber_bbox = None
+        if self.config.use_vlm_for_climber:
+            frame_path = os.path.join(self.config.images_dir, frame_names[0])
+            climber_bbox = auto_segment_climber_vlm_bbox(frame_path=frame_path, vlm_model_key=self.config.vlm_model_key,
+                                                         device=self.config.device)
+
+        # Now initialize SAM2 with full VRAM headroom
         inference_state = self.predictor.init_state(video_path=self.config.images_dir, offload_video_to_cpu=True,
                                                     offload_state_to_cpu=True)
 
-        climber_initialized = False
-        if self.config.use_vlm_for_climber:
-            climber_initialized = self.auto_segment_climber_vlm(inference_state, 0, frame_names)
-
-        if not climber_initialized:
+        # Seed SAM2 with climber bbox or fall back to manual selection
+        if climber_bbox is not None:
+            self.predictor.add_new_points_or_box(
+                inference_state=inference_state,
+                frame_idx=0,
+                obj_id=self.CLIMBER_OBJECT_ID,
+                box=climber_bbox,
+            )
+        else:
             if self.config.use_vlm_for_climber and not self.config.vlm_fallback_to_manual:
                 raise RuntimeError("VLM climber detection failed and vlm_fallback_to_manual is False.")
             self.manually_select_object(inference_state, TrackedObjectType.Climber, 0, frame_names)
@@ -1085,96 +1099,23 @@ class ChalkGpt:
 
         return None
 
+
     def auto_segment_climber_vlm(self, inference_state, frame_idx: int, frame_names: List[str]) -> bool:
         """
-        Use a local VLM to detect the climber's bounding box in frame_idx and
-        initialize SAM2 tracking via add_new_points_or_box(box=...).
-        The model is loaded, used, and immediately deleted to free VRAM.
+        Use VLM to detect climber bbox and seed SAM2 with it.
+        This wrapper calls auto_segment_climber_vlm_bbox and adds the box to SAM2.
         Returns True on success, False on failure.
         """
-        MODELS = {
-            "qwen": "Qwen/Qwen2-VL-2B-Instruct",
-            "qwen3": "Qwen/Qwen3-VL-8B-Instruct",
-            "256M": "HuggingFaceTB/SmolVLM2-256M-Video-Instruct",
-            "500M": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
-            "2.2B": "HuggingFaceTB/SmolVLM2-2.2B-Instruct",
-        }
-        model_id = MODELS.get(self.config.vlm_model_key)
-        if model_id is None:
-            print(f"[VLM] Unknown vlm_model_key: '{self.config.vlm_model_key}'. "
-                  f"Valid keys: {list(MODELS.keys())}")
-            return False
-
         frame_path = os.path.join(self.config.images_dir, frame_names[frame_idx])
-        pil_image = Image.open(frame_path).convert('RGB')
-        img_w, img_h = pil_image.size
-
-        prompt_text = (
-            f"There is exactly one climber in this {img_w}x{img_h} image. "
-            f"Output ONLY a JSON object with the bounding box around the climber's full body "
-            f"in pixel coordinates using this exact format: "
-            f'{{\"x1\": <left>, \"y1\": <top>, \"x2\": <right>, \"y2\": <bottom>}}. '
-            f"Example: "
-            f'{{\"x1\": 120, \"y1\": 80, \"x2\": 350, \"y2\": 650}}'
-        )
-
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "url": frame_path},
-                    {"type": "text", "text": prompt_text},
-                ],
-            }
-        ]
-
-        # Deferred import — zero overhead when VLM is disabled
-        from transformers import AutoProcessor, AutoModelForImageTextToText
-
-        print(f"[VLM] Loading {model_id} for automatic climber detection...")
-        processor = AutoProcessor.from_pretrained(model_id)
-        vlm_model = AutoModelForImageTextToText.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
-        ).to(self.config.device)
-
-        inputs = processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to(self.config.device) if hasattr(v, 'to') else v
-                  for k, v in inputs.items()}
-
-        generated_ids = vlm_model.generate(**inputs, max_new_tokens=60, do_sample=False)
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-
-        # Strip echoed user turn if the model includes it
-        if "Assistant:" in generated_text:
-            generated_text = generated_text.split("Assistant:")[-1].strip()
-
-        # Free VRAM before SAM2 propagation
-        del vlm_model, processor, inputs, generated_ids
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        print(f"[VLM] Raw output: {generated_text!r}")
-
-        result = self._parse_vlm_bbox(generated_text, img_w, img_h)
-        if result is None:
-            print("[VLM] Failed to parse bounding box from VLM output.")
+        bbox = self.auto_segment_climber_vlm_bbox(frame_path)
+        if bbox is None:
             return False
-
-        x1, y1, x2, y2 = result
-        print(f"[VLM] Detected climber bbox: [{x1:.0f}, {y1:.0f}, {x2:.0f}, {y2:.0f}]")
 
         self.predictor.add_new_points_or_box(
             inference_state=inference_state,
             frame_idx=frame_idx,
             obj_id=self.CLIMBER_OBJECT_ID,
-            box=np.array([x1, y1, x2, y2], dtype=np.float32),
+            box=bbox,
         )
         return True
 
@@ -1331,7 +1272,7 @@ class ChalkGpt:
 if __name__ == "__main__":
     config: ChalkGptConfig = ChalkGptConfig(save_to_disk=True,
                                             try_to_load_from_disk=False,
-                                            images_dir='videos/fat_guy',
+                                            images_dir='videos/geek',
                                             # video_file='romi.mp4',
                                             device=torch.device("cuda:0" if torch.cuda.is_available() else "cpu"),
                                             matcher_threshold=.9,
@@ -1342,7 +1283,7 @@ if __name__ == "__main__":
                                             save_video_path='output',
                                             video_fps=30,
                                             use_vlm_for_climber=True,
-                                            vlm_model_key="qwen3",
+                                            vlm_model_key="2.2B",
                                             vlm_fallback_to_manual=True)
     chalk_gpt: ChalkGpt = ChalkGpt(config)
     chalk_gpt.main()
